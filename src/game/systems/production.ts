@@ -252,6 +252,9 @@ export function placeStructure(
 
   const building = createBuilding(state, type, tx, ty, player);
   markMapRectDirty(state, building.tx, building.ty, building.w, building.h);
+  // Debrief stat: a structure the player put on the map. The pre-placed
+  // starting ConYard goes through `createBuilding` directly and is not counted.
+  state.stats[player].buildingsBuilt++;
 
   queue.items.shift();
   queue.pendingPlacement = undefined;
@@ -298,6 +301,9 @@ export function sellBuilding(state: GameState, player: PlayerId, b: Building): n
   const refund = refundOf(b.type);
   const p = state.players[player];
   p.credits += refund;
+  // Debrief stat: counted on the tick of sale, not when the dismantle finishes
+  // (that death is `quiet`, so it is deliberately never a `buildingsLost`).
+  state.stats[player].buildingsSold++;
 
   b.status = 'selling';
   b.sellAt = state.tick + SELL_TIME;
@@ -373,6 +379,7 @@ export function spawnFromBuilding(
   // ground, and a pad hemmed in by structures must still be able to produce.
   if (UNIT_TYPES[type].isAir) {
     const unit = createUnit(state, type, b.tx, b.ty, b.player);
+    state.stats[b.player].unitsProduced++;
     const c = buildingCenter(b);
     unit.pos.x = c.x;
     unit.pos.y = c.y;
@@ -388,6 +395,10 @@ export function spawnFromBuilding(
   const tile = spawnTileFor(state, b);
   if (!tile) return null;
   const unit = createUnit(state, type, tile.tx, tile.ty, b.player);
+  // Debrief stat: this is the one place a unit is *produced*, so it covers both
+  // the unit queue and the free harvester a Refinery brings (`useRally` false).
+  // The starting minigunner from `initSkirmish` is not counted.
+  state.stats[b.player].unitsProduced++;
   if (!useRally) return unit;
 
   let rtx: number;
@@ -493,6 +504,9 @@ function advanceQueue(state: GameState, p: PlayerState, tab: QueueTab): void {
       return;
     }
     p.credits -= need;
+    // Debrief stat: production drip is the only thing that spends money in this
+    // game. Refunds (queue cancel, sell) are not subtracted — "spent" is gross.
+    state.stats[p.id].creditsSpent += need;
     item.spent = targetSpent;
     item.progress = next;
   }

@@ -457,6 +457,75 @@ export interface EvaMessage {
 export type GameResult = 'playing' | 'won' | 'lost';
 
 // ---------------------------------------------------------------------------
+// Match statistics (post-release: debriefing)
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-player counters for the post-match debriefing screen.
+ *
+ * Every field is incremented **at the source of truth inside `tick()`** — the
+ * system that actually performs the action — so the numbers are as deterministic
+ * as the sim itself and cost one `++` each (no scans, no per-tick sampling).
+ * Mission length is not tracked here: it is `state.tick`.
+ *
+ * The exact rules (documented in SPEC "Post-release: match debriefing"):
+ *
+ *   unitsProduced      a unit rolled out of a production building, including
+ *                      the free harvester a Refinery brings. The two starting
+ *                      units from `initSkirmish` are *not* counted — they were
+ *                      issued, not produced — and neither is `__game.spawn`.
+ *   unitsLost          a unit of this player died a real death. A *quiet* death
+ *                      (an engineer consumed by a capture) is not a loss.
+ *   unitsKilled        this player destroyed an enemy unit. Credit needs an
+ *                      attributable source of a *different* player: a
+ *                      friendly-fire death (own artillery splash) is the
+ *                      victim's loss and nobody's kill, and a death with no
+ *                      source at all (a debug hit, splash from a shot with no
+ *                      firer) is a loss for the victim and unattributed.
+ *   buildingsBuilt     a structure this player placed on the map. The starting
+ *                      ConYard is not counted (same rule as starting units).
+ *   buildingsLost      a structure of this player was *destroyed*. Selling and
+ *                      losing it to a capture are not losses (they have their
+ *                      own counters).
+ *   buildingsRazed     this player destroyed an enemy structure. Same
+ *                      attribution rule as `unitsKilled`.
+ *   buildingsCaptured  this player took an enemy structure with an engineer.
+ *   buildingsSold      this player dismantled one of their own structures.
+ *   creditsHarvested   credits a refinery actually *banked* for this player,
+ *                      i.e. what they received — overflow lost to a full silo
+ *                      bank is not counted.
+ *   creditsSpent       credits drip-charged by production. Nothing else spends
+ *                      money in this game, and refunds are not subtracted.
+ */
+export interface PlayerStats {
+  unitsProduced: number;
+  unitsLost: number;
+  unitsKilled: number;
+  buildingsBuilt: number;
+  buildingsLost: number;
+  buildingsRazed: number;
+  buildingsCaptured: number;
+  buildingsSold: number;
+  creditsHarvested: number;
+  creditsSpent: number;
+}
+
+export function createPlayerStats(): PlayerStats {
+  return {
+    unitsProduced: 0,
+    unitsLost: 0,
+    unitsKilled: 0,
+    buildingsBuilt: 0,
+    buildingsLost: 0,
+    buildingsRazed: 0,
+    buildingsCaptured: 0,
+    buildingsSold: 0,
+    creditsHarvested: 0,
+    creditsSpent: 0,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // UI intent (armed cursor modes)
 // ---------------------------------------------------------------------------
 
@@ -507,6 +576,12 @@ export interface GameState {
   ui: UiState;
   fog: FogState;
   result: GameResult;
+  /**
+   * Post-release: per-player match counters for the debriefing screen. Written
+   * only by the systems that own each event, inside `tick()`; the debrief screen
+   * reads them and never writes. Reset naturally by `createGameState`.
+   */
+  stats: [PlayerStats, PlayerStats];
   /** Seeded RNG owned by the sim. */
   rng: Rng;
   /** EVA ticker backlog (Phase 6 renders it). */
@@ -579,6 +654,7 @@ export function createGameState(seed: number): GameState {
       version: 0,
     },
     result: 'playing',
+    stats: [createPlayerStats(), createPlayerStats()],
     rng: gameRng,
     messages: [],
     dirtyTiles: [],

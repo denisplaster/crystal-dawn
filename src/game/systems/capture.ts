@@ -199,6 +199,11 @@ export function captureBuilding(state: GameState, engineer: Unit, b: Building): 
     releaseHarvester(state, u);
   }
 
+  // Debrief stat: the taker scores a capture. The previous owner does *not*
+  // score a `buildingsLost` — that counter means "destroyed", and this building
+  // is still standing (it is simply on the other side of the map's ledger now).
+  state.stats[to].buildingsCaptured++;
+
   b.player = to;
   b.rally = undefined;
   b.targetId = undefined;

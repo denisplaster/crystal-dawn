@@ -622,6 +622,9 @@ function stepUnloading(state: GameState, u: Unit): void {
   const room = Math.max(0, p.storage - p.credits);
   const gained = Math.min(step, room);
   p.credits += gained;
+  // Debrief stat: what the player actually *received*. Overflow burned against
+  // a full bank ("Silos needed") is not counted, because it never arrived.
+  state.stats[u.player].creditsHarvested += gained;
   if (gained < step && u.player === PLAYER_HUMAN) {
     postMessage(state, 'Silos needed', 'warning');
   }

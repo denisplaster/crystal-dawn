@@ -29,6 +29,7 @@ import {
   type GameResult,
   type GameState,
   type OrderKind,
+  type PlayerStats,
   type UnitStance,
 } from './game/state';
 import {
@@ -67,6 +68,7 @@ import { Sfx, SFX_NAMES, type SfxName } from './audio/sfx';
 import { Renderer } from './render/renderer';
 import { auditSprites, initSprites, type SpriteAuditEntry } from './render/sprites';
 import { BRIEFING_CHARS, BriefingScreen } from './render/briefing';
+import { DebriefScreen, missionTime } from './render/debrief';
 import { Hud } from './render/hud';
 import {
   DEFAULT_MAP,
@@ -146,6 +148,15 @@ const hud = new Hud(camera);
 renderer.hudDraw = (ctx, gs) => hud.drawObjectives(ctx, gs);
 renderer.overlayDraw = (ctx) => hud.drawHelp(ctx);
 
+/**
+ * Post-match debriefing. It replaces the Phase 5 result curtain in the same
+ * slot; `main.ts` supplies the mission identity (map / sector / difficulty)
+ * because the renderer has never known about those.
+ */
+const debrief = new DebriefScreen();
+renderer.resultDraw = (ctx, gs, w, h) =>
+  debrief.draw(ctx, gs, { mapLabel: mapDef(mapChoice).label, seed: mapSeed, difficulty }, w, h);
+
 /** EVA's opening line, queued through the ordinary message stream. */
 const MISSION_OBJECTIVE_LINE = 'Objective: destroy all enemy structures.';
 
@@ -215,6 +226,9 @@ function restart(level?: AiDifficulty): GameState {
   // first-mission hint check. The collapsed/seen preferences are persisted and
   // deliberately survive.
   hud.onMissionStart();
+  // The debriefing's count-up runs off its own frame counter, so it is rewound
+  // with the other render-side caches rather than keyed on state.tick.
+  debrief.reset();
   objectiveLinePending = true;
   camera.centerOnTile(humanStartTile(state).tx, humanStartTile(state).ty);
   return state;
@@ -295,8 +309,18 @@ function tick(): void {
     const snap = sidebar.update(state, hudSnap);
     updateOrders(state, snap);
   } else {
-    // Mission decided: the curtain is up, orders are ignored, and the only
-    // input that means anything is "play again".
+    // Mission decided: the debriefing panel is up, orders are ignored, and the
+    // only input that means anything is "play again" or "back to command".
+    // 'T' returns to the title screen. That is clean by construction: the title
+    // phase returns from the tick before `camera.pan` and every system, so the
+    // decided state simply stops being ticked, and the title owns its own input
+    // from the next tick on. The next deploy runs `startMission()` -> `restart()`
+    // as usual, so nothing about the finished game survives.
+    if (hudSnap.pressed.has('KeyT')) {
+      phase = 'title';
+      input.endTick();
+      return;
+    }
     const clicked = hudSnap.clicks.some((c) => c.button === 0);
     if (hudSnap.pressed.has('KeyR') || clicked) {
       restart();
@@ -355,6 +379,9 @@ function render(alpha: number): void {
   });
   // Sound is produced here, never in the tick: the sim must not depend on it.
   sfx.consume(state, { x: camera.x, y: camera.y, w: camera.viewW, h: camera.viewH });
+  // The debriefing tally ticks audibly on its way up. The panel itself imports
+  // no audio; it just reports when the count crossed another step.
+  if (state.result !== 'playing' && debrief.takeBeep()) sfx.play('click');
 }
 
 const loop = new GameLoop({ tick, render });
@@ -475,6 +502,17 @@ export interface GameApi {
   /** Current mission result. */
   result(): GameResult;
   /**
+   * Live match statistics — the same table the debriefing screen reads. The
+   * `players` entries are the actual `GameState.stats` objects, so they keep
+   * moving while the mission runs; `tick`/`time`/`result` are a snapshot.
+   */
+  stats(): {
+    tick: number;
+    time: string;
+    result: GameResult;
+    players: [PlayerStats, PlayerStats];
+  };
+  /**
    * Full restart without a page reload: fresh state, map cache, fog and AI.
    * Optionally switches difficulty for the new game.
    */
@@ -576,7 +614,11 @@ const api: GameApi = {
   damage(id: number, amount: number, sourceId?: number): number {
     const e = findCombatant(state, id);
     if (!e) return -1;
-    damageEntity(state, e, Number.isFinite(amount) ? amount : 0, sourceId);
+    // Resolve the attacker's house so a scripted hit scores a kill exactly like
+    // a real shot does. In the sim proper this comes off `Projectile.player`
+    // (no lookup); here the id is all the caller gave us.
+    const src = sourceId !== undefined ? findCombatant(state, sourceId) : undefined;
+    damageEntity(state, e, Number.isFinite(amount) ? amount : 0, sourceId, src?.player);
     return e.hp;
   },
 
@@ -690,6 +732,15 @@ const api: GameApi = {
 
   result(): GameResult {
     return state.result;
+  },
+
+  stats() {
+    return {
+      tick: state.tick,
+      time: missionTime(state.tick),
+      result: state.result,
+      players: state.stats,
+    };
   },
 
   restart(level?: string): GameState {

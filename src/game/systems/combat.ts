@@ -39,6 +39,7 @@ import {
   clamp,
   tileCenter,
   worldToTile,
+  type PlayerId,
 } from '../constants';
 import { isPassable } from '../map';
 import { findNearestPassable } from '../pathfinding';
@@ -592,12 +593,20 @@ export function issueAttackOrder(
  * explore stance runs *away* from, and it is passed straight through from the
  * projectile's `sourceId`. An unattributed hit still triggers the reflex, it
  * just has to guess a direction (see `fleeFrom`).
+ *
+ * `sourcePlayer` is the *house* that fired, carried alongside `sourceId` for the
+ * match statistics. It is deliberately a separate argument rather than something
+ * derived from `sourceId`: the firer may already be dead (or gone) by the time
+ * its round lands, and resolving an id would cost an entity scan per hit.
+ * `Projectile.player` already holds exactly this value, so every real shot has
+ * it and only test helpers arrive unattributed.
  */
 export function damageEntity(
   state: GameState,
   e: Combatant,
   amount: number,
   sourceId?: number,
+  sourcePlayer?: PlayerId,
 ): void {
   if (e.dead || amount <= 0) return;
   e.hp -= amount;
@@ -605,7 +614,7 @@ export function damageEntity(
     postThrottled(state, 'Base under attack', 'alert', EVA_ATTACK_THROTTLE);
   }
   if (e.hp <= 0) {
-    killEntity(state, e);
+    killEntity(state, e, false, sourcePlayer);
     return;
   }
   if (isUnitEntity(e)) reactToDamage(state, e, sourceId);
@@ -623,11 +632,35 @@ export function damageEntity(
  * the structure was dismantled, not blown up. V2 extends it to *units* for the
  * same reason: an engineer that captures a structure is consumed, not lost, so
  * it neither explodes nor posts "Unit lost".
+ *
+ * `sourcePlayer` is the house that killed it, used only for the match
+ * statistics. Kill credit needs an attributable source of a *different* player:
+ * a friendly-fire death (own artillery splash) is the victim's loss and nobody's
+ * kill, and an unattributed death is a loss for the victim only. A `quiet` death
+ * is neither a loss nor a kill — the thing was dismantled or consumed, not
+ * destroyed (selling has `buildingsSold`, capture has `buildingsCaptured`).
  */
-export function killEntity(state: GameState, e: Combatant, quiet = false): void {
+export function killEntity(
+  state: GameState,
+  e: Combatant,
+  quiet = false,
+  sourcePlayer?: PlayerId,
+): void {
   if (e.dead) return;
   e.dead = true;
   e.hp = 0;
+
+  if (!quiet) {
+    const unit = isUnitEntity(e);
+    const victim = state.stats[e.player];
+    if (unit) victim.unitsLost++;
+    else victim.buildingsLost++;
+    if (sourcePlayer !== undefined && sourcePlayer !== e.player) {
+      const killer = state.stats[sourcePlayer];
+      if (unit) killer.unitsKilled++;
+      else killer.buildingsRazed++;
+    }
+  }
 
   if (isUnitEntity(e)) {
     e.order = undefined;
@@ -679,6 +712,7 @@ export function applySplash(
   exclude?: number,
   sourceId?: number,
   weaponId?: WeaponId,
+  sourcePlayer?: PlayerId,
 ): void {
   if (radius <= 0) return;
   // V2: a burst only reaches the air if the weapon that produced it does. An
@@ -691,7 +725,13 @@ export function applySplash(
     if (d >= radius) return;
     const falloff = 1 - d / radius;
     const scale = weapon ? airFactor(weapon, e) : 1;
-    damageEntity(state, e, damageAgainst(damage * falloff * scale, warhead, armorOf(e)), sourceId);
+    damageEntity(
+      state,
+      e,
+      damageAgainst(damage * falloff * scale, warhead, armorOf(e)),
+      sourceId,
+      sourcePlayer,
+    );
   };
   // Small radii, so a straight scan beats maintaining another index.
   for (let i = state.units.length - 1; i >= 0; i--) hit(state.units[i] as Unit);
@@ -1014,6 +1054,7 @@ function detonate(state: GameState, p: Projectile, direct?: Combatant): void {
       direct,
       damageAgainst(p.damage * scale, warhead, armorOf(direct)),
       p.sourceId,
+      p.player,
     );
   }
   if (p.splash > 0) {
@@ -1027,6 +1068,9 @@ function detonate(state: GameState, p: Projectile, direct?: Combatant): void {
       direct?.id,
       p.sourceId,
       p.weapon,
+      // Kill credit follows the *house* that fired, which the round carries
+      // itself — so a shot still scores after its firer has died in flight.
+      p.player,
     );
   }
   addEffect(state, {

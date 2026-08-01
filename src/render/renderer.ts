@@ -120,6 +120,17 @@ export class Renderer {
    */
   overlayDraw: ((ctx: CanvasRenderingContext2D, state: GameState) => void) | null = null;
 
+  /**
+   * Post-release: the post-match debriefing panel (`render/debrief.ts`), which
+   * replaced the Phase 5 flat curtain. Called for a decided mission only, in the
+   * curtain's old slot — after the sidebar and the objectives readout, before
+   * the modal overlay — so it dims everything under it and the help screen still
+   * sits on top. Another additive hook, exactly like `sidebarDraw` / `hudDraw`.
+   */
+  resultDraw:
+    | ((ctx: CanvasRenderingContext2D, state: GameState, w: number, h: number) => void)
+    | null = null;
+
   constructor(canvas: HTMLCanvasElement, camera: Camera) {
     this.camera = camera;
     this.ctx = canvas.getContext('2d', { alpha: false }) as CanvasRenderingContext2D;
@@ -233,54 +244,20 @@ export class Renderer {
   }
 
   /**
-   * Mission result curtain (Phase 5). Drawn over everything, sidebar included,
-   * once `state.result` leaves 'playing'. The sim keeps ticking underneath; the
-   * tick just stops accepting orders and listens for R / a click to restart.
+   * Mission result. Phase 5 drew a flat curtain here; post-release it is the
+   * full debriefing panel, owned by `render/debrief.ts` and installed through
+   * `resultDraw` (the renderer knows nothing about the map name, the difficulty
+   * or the stat table — `main.ts` closes over those, exactly as it does for the
+   * sidebar and the HUD).
+   *
+   * The sim keeps ticking underneath; the tick just stops accepting orders and
+   * listens for R / a click (restart) or T (back to the title).
    */
   private drawResultOverlay(state: GameState): void {
     if (state.result === 'playing') return;
-    const ctx = this.ctx;
+    if (!this.resultDraw) return;
     const cam = this.camera;
-    const won = state.result === 'won';
-
-    ctx.fillStyle = 'rgba(0, 0, 0, 0.62)';
-    ctx.fillRect(0, 0, cam.canvasW, cam.canvasH);
-
-    const cx = Math.round(cam.canvasW / 2);
-    const cy = Math.round(cam.canvasH / 2);
-    const title = won ? 'MISSION ACCOMPLISHED' : 'MISSION FAILED';
-    // Scale to fit the narrowest sensible window, then clamp to a pixel-art
-    // friendly range.
-    const size = Math.max(14, Math.min(44, Math.floor((cam.canvasW - 40) / (title.length * 0.62))));
-
-    ctx.save();
-    ctx.textAlign = 'center';
-    ctx.textBaseline = 'middle';
-
-    // Blocky drop shadow + hard outline: reads as chunky pixel type.
-    ctx.font = `bold ${size}px "Courier New", monospace`;
-    ctx.fillStyle = '#000';
-    ctx.fillText(title, cx + 4, cy + 4);
-    ctx.fillStyle = won ? '#8dff6a' : '#ff5a48';
-    ctx.fillText(title, cx, cy);
-
-    // Rule under the headline.
-    const ruleW = Math.min(cam.canvasW - 60, title.length * size * 0.62);
-    ctx.fillStyle = won ? 'rgba(141,255,106,0.55)' : 'rgba(255,90,72,0.55)';
-    ctx.fillRect(cx - ruleW / 2, cy + size * 0.85, ruleW, 2);
-
-    // Blinking prompt (off `state.tick`, so it stops when the sim is paused).
-    if (Math.floor(state.tick / 10) % 2 === 0) {
-      const small = Math.max(10, Math.floor(size * 0.42));
-      ctx.font = `bold ${small}px "Courier New", monospace`;
-      ctx.fillStyle = '#000';
-      ctx.fillText('PRESS R TO RESTART', cx + 2, cy + size * 1.7 + 2);
-      ctx.fillStyle = '#e6f2b8';
-      ctx.fillText('PRESS R TO RESTART', cx, cy + size * 1.7);
-    }
-    ctx.restore();
-    ctx.textAlign = 'left';
-    ctx.textBaseline = 'top';
+    this.resultDraw(this.ctx, state, cam.canvasW, cam.canvasH);
   }
 
   /**

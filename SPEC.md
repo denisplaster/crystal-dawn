@@ -1604,3 +1604,214 @@ real tick order, with a recording 2D context for the title/briefing smoke), **29
    enemy building: the tanks should open fire while the engineer walks in past them.
 6. **R after defeat** replays the same map; going back to the title (`__game.phase('title')`) and
    deploying again on RANDOM gives a new one.
+
+### Post-release: match debriefing
+
+Player feedback after the V2 playthrough: *"can we add a summary after the match"* — the mission
+ended on a flat coloured headline that said nothing about what had just happened. This adds C&C's
+score screen: **per-player match statistics tracked in the sim**, and a **debriefing panel** that
+replaces the Phase 5 result curtain, counts its numbers up, and offers a second way out (back to
+the title).
+
+New file: `render/debrief.ts`. Touched: `game/state.ts` (the counters), `systems/{combat,production,
+harvest,capture}.ts` (one increment each, at the source of truth), `render/renderer.ts` (one hook,
+replacing the curtain body), `main.ts` (wiring, the T binding, `__game.stats`). No system was
+reordered, no balance number moved, and `systems/{victory,ai,movement,orders,air,fog}.ts` were not
+touched at all.
+
+**The counters.** `GameState.stats: [PlayerStats, PlayerStats]`, an additive field created by
+`createGameState` — which is what makes restart hygiene free: `restart()` is still
+`createGameState + initSkirmish`, so the table zeroes itself and no new reset call was needed.
+Ten fields per player, each incremented **inside the system that performs the action**, so a counter
+is one `++` on an event that was already happening — no scans, no per-tick sampling, and nothing to
+keep in sync. Mission length is `state.tick`; there is no separate clock.
+
+| counter | where it is written | rule |
+|---|---|---|
+| `unitsProduced` | `production.spawnFromBuilding` | the one place a unit rolls out, so it covers the unit queue **and** the Refinery's free harvester |
+| `unitsLost` | `combat.killEntity` | a real death only |
+| `unitsKilled` | `combat.killEntity` | attributed to `sourcePlayer`, and only when it differs from the victim's |
+| `buildingsBuilt` | `production.placeStructure` | a structure the player put on the map |
+| `buildingsLost` | `combat.killEntity` | **destroyed** only |
+| `buildingsRazed` | `combat.killEntity` | same attribution rule as `unitsKilled` |
+| `buildingsCaptured` | `capture.captureBuilding` | credited to the taker |
+| `buildingsSold` | `production.sellBuilding` | on the tick of sale, not when the dismantle finishes |
+| `creditsHarvested` | `harvest.stepUnloading` | what the player actually **received** |
+| `creditsSpent` | `production.advanceQueue` | production drip, gross (refunds are not subtracted) |
+
+**The attribution rules, stated exactly** (this was the one genuinely ambiguous piece):
+
+- **Kill credit follows the house, not the entity.** `damageEntity` and `killEntity` gained an
+  optional `sourcePlayer`, threaded exactly the way `sourceId` already flows and fed from
+  **`Projectile.player`** — a field that has existed since Phase 4. It is deliberately *not* derived
+  from `sourceId`: the firer is frequently dead by the time its round lands (measured in the
+  harness), and resolving an id would cost an entity scan per hit. A shot therefore still scores
+  after its firer has been destroyed mid-flight.
+- **Friendly fire is the victim's loss and nobody's kill.** Credit requires `sourcePlayer !==
+  victim.player`, so a blob of your own artillery firing into a melee costs you units and earns you
+  nothing. The enemy does not get credit for it either — they did not do it.
+- **An unattributed death** (splash from a round with no firer, `__game.damage` with no source) is a
+  loss for the victim and is scored by nobody. `__game.damage(id, amount, sourceId)` does resolve
+  the source's house when given one, so a scripted hit scores exactly like a real shot.
+- **A `quiet` death is neither a loss nor a kill.** That is the Phase 7 sell path and the V2
+  capture path: a dismantled structure is `buildingsSold`, a captured one is `buildingsCaptured`
+  for the taker and *nothing at all* for the loser (it is still standing — it just changed hands),
+  and an engineer consumed by a capture is not a casualty.
+- **Starting units and the pre-placed ConYard are not counted.** `initSkirmish` calls `createUnit` /
+  `createBuilding` directly, so the free minigunner and the opening ConYard were *issued*, not
+  produced. Same for `__game.spawn`. Documented rather than special-cased: "UNITS BUILT" means units
+  that came out of a factory.
+- **`creditsHarvested` is net of overflow.** A deposit that hits a full bank ("Silos needed") is
+  burned at the refinery and never arrives, so it is not counted. The counter answers "how much
+  money did the crystal actually make you", not "how much crystal did you dig".
+
+**The debriefing panel (`render/debrief.ts`).** Same discipline as `title.ts` / `briefing.ts`:
+render-side only, reads `state.stats` and never writes, and animates off its own render-frame
+counter rather than `state.tick` (the sim keeps ticking under the panel — the Phase 5 note that the
+curtain does not pause the sim still stands).
+
+- **It replaces the curtain in the curtain's own slot.** `Renderer.drawResultOverlay` now delegates
+  to a new additive `resultDraw` hook, exactly like `sidebarDraw` / `hudDraw` / `overlayDraw`, and
+  is still called after the sidebar and the objectives readout and **before** the help overlay — so
+  the debrief dims the HUD along with everything else and F1 still reads over the top of it.
+  `main.ts` closes over the map label, seed and difficulty, which the renderer has never known about.
+- **Content:** headline (`MISSION ACCOMPLISHED` green / `MISSION FAILED` red — the same wording
+  `Hud.objectiveHeadline` uses, so the two can never disagree), then
+  `MAP CHARLIE - SECTOR 0054   HARD   TIME 11:06`, then the two-column table (UNITS BUILT / UNITS
+  LOST / ENEMIES DESTROYED / STRUCTURES BUILT / LOST / RAZED / CAPTURED / [SOLD] / CREDITS
+  HARVESTED) under `YOU` and `ORDER` headers, then the two prompts.
+- **`STRUCTURES SOLD` only appears when the human sold something.** It is an emergency move, not a
+  headline stat, and an all-zero row is noise. When it does appear both columns are filled — the AI
+  sells too, in its critical-rebuild path.
+- **Count-up:** `COUNT_FRAMES = 90` (~1.5 s at 60 fps) with an ease-out, so the figures snap most of
+  the way up and settle; `countProgress(COUNT_FRAMES)` is exactly 1, so the final numbers are the
+  real ones. Eight audible steps are emitted through `DebriefScreen.takeBeep()`, which `main.ts`
+  polls from `render()` and answers with the existing `click` sting — **the panel imports no audio**,
+  keeping the Phase 6 rule that nothing outside `audio/sfx.ts` produces sound and nothing in a
+  system calls it. The restart prompt only starts blinking once the tally has landed, so the eye
+  goes to the numbers first.
+- **Layout is computed, not hardcoded.** `debriefLayout()` is a pure function (exported for the
+  headless smoke) that picks the chunkiest font scale fitting both axes, and gives the headline, the
+  mission line and the prompts each the biggest scale *they* fit at, capped by the table's — so a
+  narrow window shrinks the 41-character restart prompt rather than the numbers the screen is about.
+  The table is centred as a **block** rather than spanned across the panel: the headline sets the
+  panel width and stretching the columns to the far edge left a lake of dead space between a label
+  and its figure.
+- **Two ways out.** `PRESS R OR CLICK TO RESTART - SAME SECTOR` is the Phase 5 behaviour verbatim
+  (unchanged code, one branch lower), and `T - RETURN TO COMMAND` is new. **T is clean by
+  construction**: the title phase returns from the tick before `camera.pan` and every system, so the
+  decided state simply stops being ticked and the title owns its own input from the next tick on;
+  the next deploy is the ordinary `briefing -> startMission() -> restart()` path, so nothing about
+  the finished game survives. `nextPhase` needed no change — leaving a mission has never been a
+  phase *action*.
+- **Restart hygiene:** `restart()` calls `debrief.reset()` alongside the existing
+  `renderer.buildTerrain` / `invalidateFog` / `sidebar.reset` / `sfx.resetStream` /
+  `hud.onMissionStart`. It is the only new reset, and it is render-side.
+
+**`__game`** gained **`stats()`** — `{ tick, time: 'MM:SS', result, players: [PlayerStats,
+PlayerStats] }`, where `players` are the *live* `GameState.stats` objects, so it can be watched while
+a mission runs.
+
+**Deviations / decisions.**
+
+- **`damageEntity` / `killEntity` / `applySplash` gained an optional trailing `sourcePlayer`.**
+  Nothing was renamed and every existing call site behaves identically without it.
+- **The old curtain was deleted, not kept as a fallback.** `resultDraw` unset means the renderer
+  draws nothing for a decided mission, matching how `hudDraw` / `overlayDraw` already behave.
+- **The FIELD MANUAL was not touched.** T only does anything on a decided mission and the panel
+  itself says so; adding a binding to the in-mission help for a key that is inert in the mission
+  would have been worse than the omission.
+- **`__game.give` does not move `creditsHarvested`.** Cheat money is not income.
+
+**Verified.** `npm run build` clean. Four headless harnesses outside the repo (a freshly built
+CommonJS mirror of `src/game` + `src/engine` + `src/render`, driven through the real tick order,
+plus a recording 2D context and a spy on `drawPixelText` so the *actual strings* that reach the
+screen can be asserted), **354/354 checks**, and a fifth build of the same sources with every stat
+statement stripped out for the A/B.
+
+- **(a) stat accuracy, 69 checks.** Every counter is checked against ground truth computed
+  *independently of the counter*. A scripted 6000-tick skirmish (AI off, both sides building and
+  producing): `unitsProduced` **7 / 4** equals the units observed appearing and equals
+  queued + the Refinery's free harvester; `buildingsBuilt` **4 / 2** equals the placements the script
+  made, with the starting ConYard correctly excluded; and the money ledger
+  `start + harvested - spent == credits` closes **exactly** for both players (6000cr and 6900cr).
+  A second scene with silos and no overflow closes the crystal identity **exactly**:
+  `creditsHarvested` **8400** == 8300 crystal removed from the map + 100 aboard at the start - 0
+  aboard at the end. Attribution: an AI tank killing human infantry and the mirror image both score
+  1/0 the right way round; an **AI guard tower** scores its kill; a rocket whose firer is killed at
+  **t=5**, ~90 ticks before impact, **still scores for the house that fired it**; own artillery
+  splash killing **3 of 3** own engineers is 3 human losses and **0** kills for anybody; enemy
+  artillery into a mixed cluster scores the enemy **exactly the 3 human deaths** and **0** for its
+  own casualty; an unattributed hit is a loss and no kill. Structures: a razed power plant is
+  1 razed / 1 lost, a captured barracks is 1 captured / **0** lost / **0** razed with the engineer
+  **not** counted as a casualty, and a sold guard tower is 1 sold / **0** lost both immediately and
+  after the 30-tick dismantle.
+- **(b) determinism, restart, regression, 22 checks.** A fresh state has both blocks at ten zeroed
+  fields; a played game moves them; a restart zeroes them again. **300 debrief frames plus every
+  render-side read change nothing** (and the next ticks do, so the check is not vacuous). The same
+  seed replays bit-identically at t=4000, stats included; a different seed diverges. Medium vs light
+  tank still ends on **125/400 hp** — bit-identical to Phase 4, Phase 7, the stances phase and the
+  air phase (313 ticks at this harness's 4-tile spawn gap; hp is the load-bearing number). The
+  **20 sim-minute AI baseline on seed 1337 (normal, immortal human base) is bit-for-bit unchanged**:
+  **54,790cr** by the phase harnesses' own "sum of positive credit deltas" observer, **37** units,
+  **2** refineries, waves at **04:00 / 06:57 / 10:18 / 13:39**. The new counter reads **58,200cr** on
+  the same run — the delta observer under-counts by 3,410 because it misses any tick where a deposit
+  and a purchase land together, so `creditsHarvested` is the strictly better measure and the old
+  number is preserved only as the regression key. The AI's full-game ledger closes **exactly**
+  (17,500cr = 5000 + bonus + 58,200 - 47,200, no sells that run).
+- **(c) render smoke, 263 checks.** Six window sizes (1920x1080 down to 640x480 plus a tall 480x900)
+  x won/lost x count-up start/mid/complete: nothing throws, **no NaN and no negative-size rect**,
+  the panel is fully on screen at every size, **no two pieces of type overlap**, and nothing is drawn
+  outside the panel. The tally shows zeros on frame 1, partial figures at the half-way frame, and —
+  read back through the `drawPixelText` spy — **the exact final figures** once complete. Beeps fire
+  **exactly 8** times over the count-up, **0** afterwards, and **8 again** after `reset()`. A mission
+  still `playing` paints **0** operations and does not advance its own clock. Row rules
+  (9 with a sale, 8 without), headline wording, the mission line and the `MM:SS` clock
+  (`13320 -> 11:06`, `24000 -> 20:00`, `90000 -> 75:00`) all check out, and **every glyph the panel
+  uses exists in the 5x7 font**. Phase logic: `nextPhase` transitions unchanged, and the decided
+  branch in `main.ts` is asserted against the source — T is handled first and returns, R and a left
+  click still restart through the identical `restart(); endTick(); return;` sequence, the debrief is
+  installed on `resultDraw`, `restart()` rewinds it, and the beep is played from `render()`.
+- **(d) perf, A/B against a stats-free build.** The same sources with all 8 stat statements removed
+  produce a **byte-identical sim signature at t=8000** (sha1 `fe37de4b…` both ways), which is the
+  strongest available proof that the counters cannot affect the simulation. Timings over three runs
+  each: AI 20 sim-minutes **0.0266-0.0282 ms/tick** with stats vs **0.0267-0.0275** without
+  (p95 0.043-0.048 both ways, worst ~1.7 ms — the map-gen tick); 150v150 mixed armies + 12 gunships
+  attack-moving into each other **0.399-0.415 ms/tick** with vs **0.412-0.428** without, p95 ~0.57,
+  worst ~3.1-3.8 ms, 130 of 312 dead by t=600. The stats build is not consistently slower than the
+  build without them: the difference is inside run-to-run noise, which is what "one `++` on an event
+  that was already happening" predicts. Budgets are 50 ms and 10 ms respectively.
+
+**Known rough edges.**
+
+- **The AI's stats are shown but never explained.** "ORDER: STRUCTURES CAPTURED 0" is always 0 today
+  because the AI never builds an engineer (the V2 note stands); the row is kept for symmetry.
+- **`creditsSpent` is not on the panel.** It is tracked and exposed through `__game.stats()`, but
+  nine rows is already the most a 640x480 window will take without dropping to an illegible scale.
+- **The count-up does not respond to input.** Clicking during the tally restarts the mission rather
+  than skipping to the final figures, which is the Phase 5 behaviour preserved verbatim — but it
+  means an impatient player never sees the numbers. The briefing's two-click "reveal then start"
+  pattern would fix it and was left out deliberately: making the restart click conditional would
+  change behaviour that has shipped.
+- **T is undiscoverable in the mission.** It only exists on the debriefing panel, which says so, but
+  the FIELD MANUAL does not mention it.
+
+**What to eyeball in the browser.**
+
+1. **Win or lose a mission** (fastest: `__game.ai('easy')`, or `__game.spawn` a few medium tanks and
+   raze The Order's base; fastest of all, `__game.state.result = 'won'` for one frame). Check the
+   panel: the green/red headline, `MAP ALPHA - SECTOR 0163   NORMAL   TIME mm:ss` under it, and the
+   two columns lining up under `YOU` / `ORDER`.
+2. **The count-up feel** — the numbers should sweep up over about a second and a half with a
+   mechanical tick, settle exactly on the real figures, and only then should the restart line start
+   blinking. Cross-check the final numbers against `__game.stats()` in the console.
+3. **`T`** — press it on the panel: you should land on the title screen with the drifting backdrop,
+   able to pick a different sector and deploy into a clean mission. Then do a run where you press
+   **R** instead and confirm it still replays the *same* sector immediately, exactly as before.
+4. **Window sizes** — resize the window with the panel up (640x480 is the tight case): the panel
+   should stay centred and fully on screen, and the restart prompt should shrink before the table
+   does.
+5. **The sold row** — sell a structure ('S' with one selected) before the mission ends and confirm
+   `STRUCTURES SOLD` appears; on a run where you sell nothing it should be absent.
+6. **F1 over the panel** — the help overlay must still draw *over* the debriefing, and the
+   objectives readout underneath it should be dimmed by the panel's wash rather than fighting it.
