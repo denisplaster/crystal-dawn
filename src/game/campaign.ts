@@ -41,7 +41,18 @@ export interface Territory {
   seed: number;
   /** Ids of the territories sharing a border. Symmetric; see `assertGraph`. */
   adjacent: readonly string[];
-  /** Label anchor / link endpoint, in the 0..100 map space. */
+  /**
+   * The territory's intended position in the 0..100 map space, west to east.
+   *
+   * **V3.1**: the map screen no longer *draws* from `cx`/`cy`/`shape` — it draws
+   * a single tessellating continent built in `render/theater.ts`, where a
+   * shared border is the adjacency rather than a link between two centres. What
+   * these still do is pin the arrangement: `theater.ts` asserts at load that
+   * every `cx`/`cy` falls inside that territory's new region, so the geography
+   * the scaling was designed around (HQ on the west coast, the stronghold in the
+   * far east) cannot drift when the artwork is redrawn. `shape` is the V3
+   * outline, kept as the authoring record of that intent.
+   */
   cx: number;
   cy: number;
   /** Region outline in the same 0..100 space. Clockwise, no self-intersections. */

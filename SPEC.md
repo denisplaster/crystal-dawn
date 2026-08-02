@@ -2159,3 +2159,204 @@ booted through a stub DOM and a stub `localStorage`, with a recording 2D context
 6. **Campaign complete** — fastest is `__game.campaignInvade(id)` + `__game.campaignWin()` repeatedly
    (or edit `localStorage['crystal-dawn.campaign']`): the map should be replaced by a green
    **CONTINENT SECURED** panel with the cumulative YOU/ORDER table and the total campaign time.
+
+### V3.1: theater map art
+
+Player feedback on the V3 conquest screen, with a screenshot: *"can you make it look like a world
+map instead of shapes"*. V3 drew the thirteen territories as separate rounded blobs floating on a
+dark backdrop with visible channels between them, plus explicit "border links" between their centres
+standing in for adjacency (a documented V3 deviation). V3.1 replaces that with **one continent on an
+ocean**: a landmass with a real coastline whose thirteen regions **tessellate it exactly**, so a
+border between two territories *is* the adjacency rather than a line drawn to say so.
+
+New file: `render/theater.ts` (the map geometry). Rewritten: `render/campaign.ts` (the screen).
+`game/campaign.ts` is **behaviourally byte-identical** — one doc comment changed and nothing else.
+`main.ts` needed **zero edits**: `CampaignScreen`'s constructor, `reset`, `update`, `handleClick`,
+`plateFor` and `draw(ctx, terrain, w, h, cs)` all keep their V3 signatures, and so do
+`campaignLayout` / `territoryAt` / `pointInShape` / `plateLines` / `plateLayout`. No other file in
+`src` was touched.
+
+---
+
+#### 1. Where the geometry lives, and why
+
+**Render-side, in `render/theater.ts`.** `game/campaign.ts` is pure data + logic that the campaign
+harnesses assert on directly; a drawing's vertices are render data. The one link back is an
+*assertion*: every territory's authored `cx` / `cy` must fall inside its new region, so the
+west-to-east arrangement the difficulty scaling was designed around cannot silently drift when the
+art is redrawn. `Territory.shape` is retained as the V3 authoring record of that intent (and the V3
+logic harness still checks it); nothing draws from it any more. That trade is documented on the
+type itself.
+
+#### 2. Approach: a planar subdivision with shared, roughened edges
+
+Not thirteen outlines — **one subdivision**:
+
+- **`NODES`** is a shared vertex table in the same 0..100 continent space.
+- **`RINGS`** gives each territory as an ordered loop of *node ids*, all wound the same way.
+- An **edge** is an unordered node pair. Both territories using an edge read the **same stored
+  polyline**, so a border is drawn once and shared. No gaps, no overlaps, no hairline seams — by
+  construction, not by careful authoring.
+- Edges used by **two** faces are interior borders (thin dark line + a 1px light lift, so a border
+  reads as a ridge rather than a crack); edges used by **one** are coastline (heavier, plus a
+  bleached beach rim inside it and three fading shelf strokes outside it).
+- Straight node-to-node segments would read as a subdivided rectangle, so every edge is roughened by
+  **midpoint displacement seeded from the edge key** (FNV-1a -> `makeRng`), 3 passes -> 8 segments,
+  amplitude 20% of length on coast and 13% inside, halving per pass. Deterministic at module load,
+  no entropy, and *shared* between the two faces — which is exactly what keeps the tessellation
+  exact while the borders meander.
+
+**Geometric adjacency is made to equal the graph exactly**, which is the simplest of the options the
+brief allowed (no river/ridge motif is needed because no unwanted geometric neighbour exists). The
+mechanism is a brick-wall offset: six columns of land, and the horizontal splits of *neighbouring*
+columns **interleave** down each shared boundary. On L3 the order is salt|dry, cinder|vulture,
+dry|ironwash, vulture|glass — which is precisely what gives THE DRY MARCH a border with both CINDER
+STEPPE and VULTURE GAP while SALT VERGE borders only CINDER STEPPE. The offset pattern *is* the
+adjacency graph. Counted out: 2 + 4 + 5 + 5 + 3 interior edges down the five column boundaries plus
+7 horizontal ones = **26**, the campaign's 26 undirected edges, one per edge.
+
+`assertTheater()` runs at load, exactly like `assertGraph()`, and throws on: an edge used by more
+than two faces, a graph edge with no shared border, a shared border that is not a graph edge, a
+border shorter than 3 continent units, a degenerate or oppositely-wound ring, a region with no
+interior label anchor, a `cx`/`cy` outside its own region, and a coastline that forks, breaks or
+closes early. `COASTLINE` is built by chaining the *directed* boundary edges out of the face rings,
+so "the landmass is a single closed loop, not several islands" is proved rather than assumed.
+
+Geography, unchanged in reading: **HARROW LANDING is the green west-coast beachhead** (the only deep
+water landing), terrain runs damp green -> scrub -> dry grass -> sand -> broken rock -> black stone
+west to east matching the SPEC's own 8.0% -> 18.6% rock progression, THE DRY MARCH / VULTURE GAP /
+BLACKSPINE are **landlocked** interior country, and **OBSIDIAN CROWN is the eastern highland cape**,
+the furthest land from home, carrying a keep badge in danger red.
+
+#### 3. States and reading the front
+
+- **Owned**: gold wash + a firm gold border. **Enemy**: a *muted* dark crimson wash + a thin dim
+  border. **Attackable**: a *brighter* crimson wash, a subtle fill breath, and a bright pulsing
+  stroke on **the shared border with your own ground** — i.e. the map animates the line you would
+  actually cross, which the V3 centre-to-centre links could not express.
+- **HQ pip** on HARROW LANDING, **keep** on OBSIDIAN CROWN, and **battle scars** (one tick per
+  attempt, capped at five) along the foot of any territory that has been fought for.
+- The ocean animates off the screen's own render-side frame counter (never `state.tick`): three flat
+  sea tones, the composited terrain layer drifting at 6% as sea floor, and 84 deterministic shimmer
+  specks scrolling. The sim stays frozen exactly as on the title screen.
+
+**Two draw caches**, which is what pays for the extra art:
+
+- `land` — terrain fills, dithered texture, interior borders, coastline. Keyed on the map square's
+  size only, so it survives every click and every conquest.
+- `overlay` — ownership washes, firm borders, badges, scars and the resolved labels. Keyed on the
+  size plus a signature of the campaign, so it is rebuilt only when the front moves.
+
+Per frame that leaves: the sea, two `drawImage`s, the pulse and the hover outline.
+
+#### 4. Label rules (the V3 collision was not repeated)
+
+`campaignLabels(layout, campaign)` is **pure** and the harness asserts on it directly.
+
+1. The anchor is the region's **pole of inaccessibility** (coarse grid + two refinements), so a name
+   sits in the fat part of its region rather than on a centroid a concave outline can push against
+   an edge.
+2. **One name scale for the whole map.** The layout's body scale is used only when *every* name fits
+   within **1.6x** its own region's bounding-box width at that scale; otherwise the whole map drops
+   to scale 1. Mixing 1x and 2x bitmap type across one map reads as a mistake rather than as a
+   hierarchy. Measured: scale 2 from **1440x900** up, scale 1 below — OBSIDIAN CROWN (longest name,
+   narrowest region) is the binding case at every size.
+3. The **tier / state tag is a second line only when it fits the region** (no wider than the bbox,
+   no taller than 55% of it). Cramped regions and small windows go **name-only**: 5 of 416 placements
+   across the tested matrix, all of them IRONWASH / OBSIDIAN CROWN at 960x620 and below.
+4. **The reserved rect is the whole block** — badge above the name, scars below it — so the
+   collision pass covers everything drawn. (The first cut hung the badge off the anchor and the
+   stronghold's keep promptly landed on BLACKSPINE; the harness caught it.)
+5. Blocks are placed **largest region first**, at the anchor, then over a deterministic ring search,
+   then an exhaustive grid scan. Every candidate is clamped inside the map square before it is
+   tested, so a label can never leave the window.
+6. If the accepted block no longer covers its anchor, a **leader line** is drawn from the anchor to
+   the block. At 640x480 and up the geometry is roomy enough that none is currently needed; the path
+   fires from 560x420 down.
+
+#### 5. Deviations / decisions
+
+- **Geometry matches the graph exactly** (the brief's "simplest" option). There is no geometric
+  neighbour pair that is not a campaign adjacency, so no river/ridge separator motif was needed.
+- **The V3 centre-to-centre border links are gone.** Shared borders now carry that information, and
+  the pulse carries the "you can cross here" part better than a lit link did.
+- **`Territory.shape` / `cx` / `cy` are no longer drawn from** but are kept: `cx`/`cy` are asserted
+  to lie inside the new regions (a live invariant), `shape` is the authoring record.
+- **The map square stays square** (`campaignLayout` is untouched), because the continent space is
+  0..100 in both axes and every consumer — the plate, the controls, `main.ts` — is unchanged.
+- **The tag text gained one string**: an owned OBSIDIAN CROWN reads `CROWN HELD` rather than `HELD`.
+  Everything else (`HQ`, `HELD`, `TIER n`, `n TRIED`) is V3 verbatim.
+- **Below ~400x300 the map square is physically smaller than thirteen stacked name plates**, so the
+  no-collision guarantee is asserted from 400x300 up (the screen's real floor is 640x480).
+- **The first frame after entering the map or resizing builds both caches** — 14.2k `fillRect`s at
+  1920x1080, ~8 ms in a browser, once. Every subsequent frame is 1.7k. This is the same order as the
+  10 ms map generation the title screen already pays and was judged the right trade for a textured
+  continent that costs nothing to keep on screen.
+
+#### 6. Verified
+
+`npm run build` clean (tsc --noEmit + vite). Five headless harnesses outside the repo, driving a
+freshly compiled CommonJS mirror of the real sources through a stub DOM, a stub `localStorage`, a
+recording 2D context and a controllable rAF clock: **10,103 / 10,103 checks**.
+
+- **(a) geometry, 120 checks.** 26 interior + 31 coast edges; the geometric pair set is **exactly**
+  the campaign's 26 undirected edges in both directions. Rasterized at two window sizes: at 640x480,
+  84,547 land cells and 45,774 ocean cells with **0 pixels claimed by two territories, 0 pixels
+  inside the coast owned by nobody, and 0 territory pixels outside the coastline**; at 1920x1080,
+  143,302 / 77,598 with the same three zeros. Every graph edge is at least **26.1 px** of drawn
+  shared border at 640x480 (shortest: RIFT COLLAR ~ VULTURE GAP; floor asserted at 20 px). Smallest
+  region **3,502 px^2** at 640x480 (EMBER FLATS) against a 1,500 px^2 clickability floor, largest
+  11,551 (HARROW LANDING); 23,736 -> 78,436 px^2 at 1920x1080. Coastline closed, 248 vertices, no
+  segment jump > 6 units. Byte-identical across two module loads (deterministic).
+- **(b) hit-testing, 133 checks.** Seven window sizes: **6,301 interior samples, 0 wrong**; all 13
+  anchors hit-test to themselves; **all 13 clickable at 640x480**; 1,381 offshore samples, **0** hit
+  a territory; points outside the map square return null. 416 border side-samples stepped 0.35 units
+  off each border segment: **0 misclassified** (both sides always land on the two owners).
+  Click routing: ASHEN REACH and KARST LINE select and open the plate, HARROW LANDING (owned) and
+  OBSIDIAN CROWN (unreachable) do nothing.
+- **(c) labels, 9,518 checks.** 8 window sizes (640x480, 800x600, 960x620, 1280x800, 1440x900,
+  1920x1080, 480x900, 1100x720) x 4 ownership states (fresh / mid / nearly-done / all-owned) =
+  **416 placements: 0 rect intersections, 0 off-window**. Every name and tag fits its reserved rect,
+  every badge and scar row is inside it, every anchor is on the map square, and **every glyph exists
+  in the 5x7 font**. Deterministic, returned in continent order. Separately swept over 16 sizes from
+  400x300 to 2560x1440 x 3 states: **0 collisions, 0 off-window**.
+- **(d) regression, 279 checks.** *Campaign logic*: 52 directed / 26 undirected edges, symmetry, no
+  self-loops, tier distribution `1/2/3/3/3/1`, no edge skipping a tier, **the id/seed list asserted
+  verbatim**, the fresh front, a loss changing nothing, resolve-twice being a no-op, the front
+  growing on a win, tick accumulation, first-invasion and stronghold configs (easy/+600/LIGHT and
+  hard/+7400/5 prebuilt/OVERWHELMING), save round-trip, **8 corrupt inputs -> fresh campaign**, and a
+  false `"victory"` corrected. *Phase actions*: all seven `nextPhase` branches unchanged and the
+  whole public surface `main.ts` uses still present. *Render smoke*: 7 sizes x 3 states x **45
+  frames = 945 frames, 0 throws, 0 NaN coordinates, 0 negative-size rects**, with hover, an open
+  invade plate and an armed reset exercised; a font spy confirms all 13 names + header + progress
+  line + `HQ` + both controls reach the screen. *Perf* at 1920x1080: **0.0125 ms/frame mean, 0.0169
+  p95** (0.0220 / 0.0285 with the invade plate up) against the 0.2 ms budget and a 16.7 ms frame;
+  0.0104 ms at 640x480.
+- **(e) the V3 loop through the real `main.ts`, 53 checks.** Booted through the stub DOM with a
+  driven rAF clock: `C` opens the map; clicking OBSIDIAN CROWN from home does nothing; clicking
+  ASHEN REACH selects without counting an attempt; **LAUNCH ASSAULT reaches the briefing, counts the
+  attempt and saves immediately**; two briefing clicks deploy onto **seed 1326 at easy**;
+  `campaignWin()` flips the territory and grows the front to `dry, karst, salt`, and **60 further
+  ticks do not re-resolve**; the debrief click returns to the map and all five sampled territories
+  hit-test correctly against the new save. A loss leaves `owned` byte-identical and **`R` retries the
+  same seed**. The remaining eleven are taken stronghold-last: **13/13 owned, `victory` fired, 12
+  won**, the CONTINENT SECURED screen draws clean, `campaignReset()` empties it and removes the save
+  key, and the map redraws without error across three live window resizes.
+
+#### 7. What to eyeball in the browser
+
+1. **Press C from the title.** It should read as **one continent on an ocean** — a coastline with
+   bays and headlands, sea shelf glow around it, shimmer specks drifting — not thirteen floating
+   shapes. There should be **no gap anywhere between two territories**.
+2. **Fresh campaign.** HARROW LANDING green on the west coast with the gold HQ pip; ASHEN REACH and
+   KARST LINE in brighter crimson with the **border they share with HARROW pulsing**; everything
+   else muted dark crimson; OBSIDIAN CROWN darkest, far east, with the red keep badge.
+3. **Mid campaign** (take four or five). The gold belt should read as a front moving west to east,
+   with the pulse jumping to the new border. Retry a territory and lose: `TIER n - 2 TRIED` plus two
+   scar ticks under the name.
+4. **Resize from 640x480 to full screen.** No two labels should ever touch; names step from 1x to 2x
+   bitmap type at about 1440x900 and the whole map steps together; IRONWASH / OBSIDIAN CROWN drop
+   their tier line at the small end.
+5. **Everything else must be identical to V3**: hit-testing, the invade plate and its copy, the
+   header and progress line, the double-confirm RESET CAMPAIGN, T MENU, the footer hint, and the
+   CONTINENT SECURED panel.
