@@ -132,6 +132,75 @@ export function isAiDifficulty(v: string): v is AiDifficulty {
 }
 
 // ---------------------------------------------------------------------------
+// Scaling (V3 — conquest campaign)
+// ---------------------------------------------------------------------------
+
+/**
+ * Multiplicative pressure knobs layered *on top of* a difficulty tuple.
+ *
+ * The conquest campaign needs "the same difficulty, but harder the more land
+ * you hold" — a continuum between the three fixed levels rather than a fourth
+ * one. Nothing here forks the AI: every consumer reads the difficulty tuple
+ * through `aiTuning(ai)`, which returns the **exact same object** when the
+ * scaling is neutral, so a skirmish is bit-identical to the pre-V3 build.
+ *
+ *   - `waveSize`     multiplies `waveStart` / `waveGrowth` / `waveCap`
+ *   - `waveInterval` multiplies `firstWave` / `intervalMin` / `intervalMax`
+ *                    (below 1 = waves come sooner and more often)
+ *   - `armyCap`      multiplies `armyCap`
+ */
+export interface AiScaling {
+  waveSize: number;
+  waveInterval: number;
+  armyCap: number;
+}
+
+export const NO_AI_SCALING: AiScaling = { waveSize: 1, waveInterval: 1, armyCap: 1 };
+
+export function isNeutralScaling(s: AiScaling): boolean {
+  return s.waveSize === 1 && s.waveInterval === 1 && s.armyCap === 1;
+}
+
+/** Clamp a caller-supplied scaling into a sane band (and fill in gaps). */
+export function makeAiScaling(partial: Partial<AiScaling> = {}): AiScaling {
+  const k = (v: number | undefined, lo: number, hi: number): number =>
+    Number.isFinite(v) ? clamp(v as number, lo, hi) : 1;
+  return {
+    waveSize: k(partial.waveSize, 0.5, 4),
+    waveInterval: k(partial.waveInterval, 0.25, 4),
+    armyCap: k(partial.armyCap, 0.5, 4),
+  };
+}
+
+/**
+ * The difficulty tuple this AI actually plays by. Returns `AI_DIFFICULTY[level]`
+ * itself — same object, no allocation — whenever the scaling is neutral, which
+ * is every skirmish.
+ */
+export function aiTuning(
+  difficulty: AiDifficulty,
+  scaling: AiScaling = NO_AI_SCALING,
+): AiDifficultyDef {
+  const def = AI_DIFFICULTY[difficulty];
+  if (isNeutralScaling(scaling)) return def;
+  return {
+    ...def,
+    firstWave: Math.max(1, Math.round(def.firstWave * scaling.waveInterval)),
+    intervalMin: Math.max(1, Math.round(def.intervalMin * scaling.waveInterval)),
+    intervalMax: Math.max(1, Math.round(def.intervalMax * scaling.waveInterval)),
+    waveStart: Math.max(1, Math.round(def.waveStart * scaling.waveSize)),
+    waveGrowth: Math.max(1, Math.round(def.waveGrowth * scaling.waveSize)),
+    waveCap: Math.max(1, Math.round(def.waveCap * scaling.waveSize)),
+    armyCap: Math.max(1, Math.round(def.armyCap * scaling.armyCap)),
+  };
+}
+
+/** The tuple for a running AI (difficulty + whatever scaling it was built with). */
+export function tuningOf(ai: AiState): AiDifficultyDef {
+  return aiTuning(ai.difficulty, ai.scaling);
+}
+
+// ---------------------------------------------------------------------------
 // Tunables
 // ---------------------------------------------------------------------------
 
@@ -270,6 +339,11 @@ export interface AiState {
   wantSince: number;
   /** Last wave number the late-game credit pin bumped `waveSize` on. */
   pinBumpWave: number;
+  /**
+   * V3: pressure multipliers on top of `difficulty`. `NO_AI_SCALING` for every
+   * skirmish; the conquest campaign raises it with owned territory and tier.
+   */
+  scaling: AiScaling;
 }
 
 /**
@@ -279,8 +353,9 @@ export interface AiState {
 export function createAiState(
   state: GameState,
   difficulty: AiDifficulty = DEFAULT_AI_DIFFICULTY,
+  scaling: AiScaling = NO_AI_SCALING,
 ): AiState {
-  const def = AI_DIFFICULTY[difficulty];
+  const def = aiTuning(difficulty, scaling);
   const field = homeFieldOf(state);
   let total = 0;
   for (const idx of field) total += state.map.crystal[idx] as number;
@@ -302,6 +377,7 @@ export function createAiState(
     wantUnit: null,
     wantSince: 0,
     pinBumpWave: -1,
+    scaling,
   };
 }
 
@@ -310,8 +386,8 @@ export function aiDifficulty(state: GameState, level?: AiDifficulty): AiDifficul
   const ai = state.ai;
   if (!ai) return DEFAULT_AI_DIFFICULTY;
   if (level && level !== ai.difficulty) {
-    const def = AI_DIFFICULTY[level];
     ai.difficulty = level;
+    const def = tuningOf(ai);
     // Re-scale the schedule so the change takes effect from here on.
     ai.waveSize = clamp(ai.waveSize, def.waveStart, def.waveCap);
     ai.nextWaveTick = Math.min(
@@ -604,7 +680,7 @@ function nextStructure(state: GameState, ai: AiState, p: PlayerState): BuildingT
   // 6. Phase 7 — the late-game credit pin. Army capped and the bank full: the
   //    AI used to sit on 10000cr forever. Spend it on defence first, then on
   //    silos, which raise the ceiling so the next pin is further away.
-  if (creditsPinned(p) && armySize(state, p).army >= AI_DIFFICULTY[ai.difficulty].armyCap) {
+  if (creditsPinned(p) && armySize(state, p).army >= tuningOf(ai).armyCap) {
     if (countBuildings(state, 'guardTower') < MAX_TOWERS && want('guardTower')) {
       return 'guardTower';
     }
@@ -820,7 +896,7 @@ function stepUnits(state: GameState, ai: AiState, p: PlayerState): void {
   }
 
   // --- army cap ---
-  const def = AI_DIFFICULTY[ai.difficulty];
+  const def = tuningOf(ai);
   const { army, infantry } = armySize(state, p);
   if (army >= def.armyCap) {
     ai.wantUnit = null;
@@ -1027,7 +1103,7 @@ function stepRally(state: GameState, ai: AiState, r: Roster): void {
 }
 
 function stepAttack(state: GameState, ai: AiState, r: Roster): void {
-  const def = AI_DIFFICULTY[ai.difficulty];
+  const def = tuningOf(ai);
 
   // --- keep the units already out there pointed at something ---
   if (r.attackers.length > 0) {
@@ -1123,6 +1199,10 @@ export function updateAi(state: GameState): void {
 
 export interface AiReport {
   difficulty: AiDifficulty;
+  /** V3: the pressure multipliers this AI was built with. */
+  scaling: AiScaling;
+  /** V3: the difficulty tuple after scaling — what the AI actually plays by. */
+  tuning: AiDifficultyDef;
   tick: number;
   credits: number;
   power: { produced: number; drain: number; low: boolean };
@@ -1153,8 +1233,12 @@ export function aiReport(state: GameState): AiReport {
     if (isCombatUnit(u) && !attackSet.has(u.id) && !defendSet.has(u.id)) rally++;
   }
   const head = p.queues.structures.items[0];
+  const difficulty = ai?.difficulty ?? DEFAULT_AI_DIFFICULTY;
+  const scaling = ai?.scaling ?? NO_AI_SCALING;
   return {
-    difficulty: ai?.difficulty ?? DEFAULT_AI_DIFFICULTY,
+    difficulty,
+    scaling,
+    tuning: aiTuning(difficulty, scaling),
     tick: state.tick,
     credits: Math.floor(p.credits),
     power: { produced: p.powerProduced, drain: p.powerDrain, low: p.lowPower },

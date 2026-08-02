@@ -15,7 +15,7 @@ import type { InputSnapshot } from '../engine/input';
 import type { AiDifficulty } from '../game/systems/ai';
 import { drawPixelText, measurePixelText } from './sprites';
 
-export type AppPhase = 'title' | 'briefing' | 'playing';
+export type AppPhase = 'title' | 'campaign' | 'briefing' | 'playing';
 
 // ---------------------------------------------------------------------------
 // Map selection (V2)
@@ -87,6 +87,8 @@ export type TitleAction =
   | { kind: 'difficulty'; level: AiDifficulty }
   /** Map row: the choice plus the seed it resolved to *now*. */
   | { kind: 'map'; map: MapChoice; seed: number }
+  /** V3: leave the skirmish flow for the conquest campaign map. */
+  | { kind: 'campaign' }
   /** Deploy. Carries the seed the mission must be built from. */
   | { kind: 'start'; map: MapChoice; seed: number };
 
@@ -97,27 +99,55 @@ export type BriefingAction =
   /** Click/Enter on fully-revealed text: commence the operation. */
   | { kind: 'start' };
 
-export type PhaseAction = TitleAction | BriefingAction;
+/**
+ * V3: what the conquest map can ask for (see `render/campaign.ts`). Declared
+ * here beside `BriefingAction` for the same reason that one is: `nextPhase` is
+ * the phase machine and it has to see every action kind that can move it.
+ */
+export type CampaignAction =
+  /** Confirmed on the invade plate: fight for this territory. */
+  | { kind: 'invade'; territory: string }
+  /** Opened (or dismissed, with null) the invade plate. Self-transition. */
+  | { kind: 'select'; territory: string | null }
+  /** RESET CAMPAIGN, past its second confirmation. Self-transition. */
+  | { kind: 'reset' }
+  /** Back to the main menu. */
+  | { kind: 'title' };
+
+export type PhaseAction = TitleAction | BriefingAction | CampaignAction;
 
 /**
  * The whole phase machine. Pure, so it can be exercised headlessly.
  *
- * `title --start--> briefing --start--> playing`. Every other action (picking a
- * difficulty, skipping the typewriter) leaves the phase where it is, and
- * 'playing' is terminal — leaving a mission is `restart()`, not a phase move.
+ * ```
+ * title --start----> briefing --start--> playing      (skirmish)
+ * title --campaign-> campaign --invade-> briefing --start--> playing
+ * ```
+ *
+ * Every other action (picking a difficulty, skipping the typewriter, opening
+ * the invade plate, wiping the save) leaves the phase where it is, and
+ * 'playing' is terminal — leaving a mission is `restart()` or a jump back to
+ * the campaign map from the debriefing, not a phase *action*.
  */
 export function nextPhase(phase: AppPhase, action: PhaseAction | null): AppPhase {
   if (action === null) return phase;
-  if (phase === 'title') return action.kind === 'start' ? 'briefing' : 'title';
+  if (phase === 'title') {
+    if (action.kind === 'campaign') return 'campaign';
+    return action.kind === 'start' ? 'briefing' : 'title';
+  }
+  if (phase === 'campaign') {
+    if (action.kind === 'invade') return 'briefing';
+    return action.kind === 'title' ? 'title' : 'campaign';
+  }
   if (phase === 'briefing') return action.kind === 'start' ? 'playing' : 'briefing';
   return phase;
 }
 
 export const DIFFICULTIES: readonly AiDifficulty[] = ['easy', 'normal', 'hard'];
 
-export type TitleTarget = AiDifficulty | MapChoice | 'start';
+export type TitleTarget = AiDifficulty | MapChoice | 'start' | 'campaign';
 
-export type TitleRow = 'difficulty' | 'map' | 'start';
+export type TitleRow = 'difficulty' | 'map' | 'start' | 'campaign';
 
 interface Button {
   id: TitleTarget;
@@ -150,6 +180,15 @@ const ROW_GAP = 28;
 /** Gap between the map row and the deploy button. */
 const START_GAP = 28;
 const START_H = 42;
+/**
+ * V3: the conquest-campaign entry sits *below* the skirmish block, past the
+ * sector tag, rather than being folded into it — the skirmish flow
+ * (difficulty -> sector -> deploy) reads exactly as it did, and the second mode
+ * is an alternative offered underneath it rather than a mode switch the player
+ * has to make first.
+ */
+const CAMPAIGN_GAP = 30;
+const CAMPAIGN_H = 30;
 
 export class TitleScreen {
   difficulty: AiDifficulty = 'normal';
@@ -175,8 +214,10 @@ export class TitleScreen {
   private menuTop(w: number, h: number): number {
     const scale = this.logoScale(w);
     // The block is DIFF_H + ROW_GAP + MAP_BTN_H + START_GAP + START_H tall, plus
-    // the label above it; keep all of it on screen on short windows.
-    const block = DIFF_H + ROW_GAP + MAP_BTN_H + START_GAP + START_H + 18;
+    // the campaign row under it and the label above it; keep all of it on
+    // screen on short windows.
+    const block =
+      DIFF_H + ROW_GAP + MAP_BTN_H + START_GAP + START_H + CAMPAIGN_GAP + CAMPAIGN_H + 18;
     // Never let the SELECT DIFFICULTY caption climb into the subtitle: the menu
     // starts below the logo block (drawLogo: top h*0.16, subtitle at +scale*18,
     // glyphs 8 rows tall at scale/4). On very short windows the on-screen clamp
@@ -225,14 +266,24 @@ export class TitleScreen {
     });
 
     const sw = Math.min(total, Math.max(200, bw * 2));
+    const startY = mapY + MAP_BTN_H + START_GAP;
     out.push({
       id: 'start',
       row: 'start',
       label: 'CLICK TO DEPLOY',
       x: Math.round((w - sw) / 2),
-      y: mapY + MAP_BTN_H + START_GAP,
+      y: startY,
       w: sw,
       h: START_H,
+    });
+    out.push({
+      id: 'campaign',
+      row: 'campaign',
+      label: '[C] CONQUEST CAMPAIGN',
+      x: Math.round((w - sw) / 2),
+      y: startY + START_H + CAMPAIGN_GAP,
+      w: sw,
+      h: CAMPAIGN_H,
     });
     return out;
   }
@@ -268,6 +319,7 @@ export class TitleScreen {
    */
   handleClick(w: number, h: number, x: number, y: number): TitleAction {
     const hit = this.hitTest(w, h, x, y);
+    if (hit === 'campaign') return { kind: 'campaign' };
     if (hit !== null && hit !== 'start') {
       if (isMapChoice(hit)) return this.selectMap(hit);
       this.difficulty = hit as AiDifficulty;
@@ -292,6 +344,9 @@ export class TitleScreen {
         return { kind: 'difficulty', level };
       }
     }
+    // V3: C opens the conquest campaign. Checked before Enter/Space so the
+    // deploy keys keep meaning "deploy the skirmish", unchanged.
+    if (snap.pressed.has('KeyC')) return { kind: 'campaign' };
     if (snap.pressed.has('Enter') || snap.pressed.has('Space')) return this.deploy();
 
     for (const click of snap.clicks) {
@@ -320,7 +375,7 @@ export class TitleScreen {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
     ctx.fillText(
-      '1/2/3 DIFFICULTY   CLICK SECTOR   ENTER DEPLOY   M MUTE',
+      '1/2/3 DIFFICULTY   CLICK SECTOR   ENTER DEPLOY   C CAMPAIGN   M MUTE',
       Math.round(w / 2),
       h - 18,
     );
@@ -407,6 +462,7 @@ export class TitleScreen {
 
     for (const b of buttons) {
       const isStart = b.row === 'start';
+      const isCampaign = b.row === 'campaign';
       const active =
         (b.row === 'difficulty' && b.id === this.difficulty) ||
         (b.row === 'map' && b.id === this.map);
@@ -415,22 +471,32 @@ export class TitleScreen {
 
       ctx.fillStyle = active || (isStart && blink) ? 'rgba(60, 74, 38, 0.9)' : COL.panel;
       ctx.fillRect(b.x, b.y, b.w, b.h);
-      ctx.strokeStyle = active ? COL.on : hot ? COL.bright : COL.edge;
+      ctx.strokeStyle = active ? COL.on : hot ? COL.bright : isCampaign ? COL.logo : COL.edge;
       ctx.lineWidth = active || hot ? 2 : 1;
       ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
 
-      // The map row is narrower, so CHARLIE gets a smaller face than EASY.
-      const scale = b.row === 'map' ? (measurePixelText(b.label, 2) + 8 <= b.w ? 2 : 1) : 2;
+      // The map and campaign rows carry longer labels in narrower plates, so
+      // they drop to a smaller face rather than overflowing.
+      const scale =
+        b.row === 'map' || isCampaign
+          ? measurePixelText(b.label, 2) + 8 <= b.w
+            ? 2
+            : 1
+          : 2;
       const tw = measurePixelText(b.label, scale);
       const color = active
         ? COL.on
-        : isStart
-          ? blink
-            ? COL.bright
-            : COL.text
-          : hot
-            ? COL.bright
-            : COL.text;
+        : isCampaign
+          ? hot
+            ? COL.logoEdge
+            : COL.logo
+          : isStart
+            ? blink
+              ? COL.bright
+              : COL.text
+            : hot
+              ? COL.bright
+              : COL.text;
       drawPixelText(
         ctx,
         b.label,

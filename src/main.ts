@@ -11,6 +11,20 @@
 import { Camera } from './engine/camera';
 import { Input } from './engine/input';
 import { GameLoop } from './engine/loop';
+import {
+  beginBattle,
+  campaignBattleConfig,
+  campaignReport,
+  defaultCampaignStorage,
+  isTerritoryId,
+  loadCampaign,
+  resetCampaign,
+  resolveBattle,
+  saveCampaign,
+  type CampaignBattleConfig,
+  type CampaignReport,
+  type CampaignState,
+} from './game/campaign';
 import { MAP_H, MAP_W, PLAYER_HUMAN, type PlayerId } from './game/constants';
 import {
   isBuildingType,
@@ -68,7 +82,8 @@ import { Sfx, SFX_NAMES, type SfxName } from './audio/sfx';
 import { Renderer } from './render/renderer';
 import { auditSprites, initSprites, type SpriteAuditEntry } from './render/sprites';
 import { BRIEFING_CHARS, BriefingScreen } from './render/briefing';
-import { DebriefScreen, missionTime } from './render/debrief';
+import { CampaignScreen } from './render/campaign';
+import { DebriefScreen, missionTime, type DebriefInfo } from './render/debrief';
 import { Hud } from './render/hud';
 import {
   DEFAULT_MAP,
@@ -130,15 +145,31 @@ sfx.attachUnlock(window);
 sidebar.audioStatus = () => ({ muted: sfx.muted, ready: sfx.ready });
 
 /**
- * Title -> briefing -> mission. The sim does not tick while the phase is
- * anything other than 'playing': both pre-mission screens animate off their own
- * render-side frame counters.
+ * V3 — conquest campaign. The campaign object owns its own state and its own
+ * save slot; a skirmish never touches either. `campaignBattle` is the switch
+ * that says "this mission is a campaign battle": it carries the territory, the
+ * seed and the whole resolved scaling, and it is null for every skirmish.
+ */
+const campaignStorage = defaultCampaignStorage();
+let campaign: CampaignState = loadCampaign(campaignStorage);
+let campaignBattle: CampaignBattleConfig | null = null;
+/** True once this battle's result has been folded into the campaign (once). */
+let campaignResolved = false;
+
+/**
+ * Title -> (campaign) -> briefing -> mission. The sim does not tick while the
+ * phase is anything other than 'playing': all three pre-mission screens animate
+ * off their own render-side frame counters.
  */
 const title = new TitleScreen();
 const briefing = new BriefingScreen();
+const campaignScreen = new CampaignScreen((id) => campaignBattleConfig(campaign, id));
 let phase: AppPhase = 'title';
-renderer.titleDraw = (ctx, terrain, w, h) =>
-  phase === 'briefing' ? briefing.draw(ctx, terrain, w, h) : title.draw(ctx, terrain, w, h);
+renderer.titleDraw = (ctx, terrain, w, h) => {
+  if (phase === 'briefing') briefing.draw(ctx, terrain, w, h);
+  else if (phase === 'campaign') campaignScreen.draw(ctx, terrain, w, h, campaign);
+  else title.draw(ctx, terrain, w, h);
+};
 
 /**
  * In-world HUD: objectives readout + controls overlay. Render-side only; its
@@ -154,8 +185,25 @@ renderer.overlayDraw = (ctx) => hud.drawHelp(ctx);
  * because the renderer has never known about those.
  */
 const debrief = new DebriefScreen();
-renderer.resultDraw = (ctx, gs, w, h) =>
-  debrief.draw(ctx, gs, { mapLabel: mapDef(mapChoice).label, seed: mapSeed, difficulty }, w, h);
+renderer.resultDraw = (ctx, gs, w, h) => debrief.draw(ctx, gs, missionInfo(), w, h);
+
+/**
+ * Mission identity for the briefing header and the debriefing panel. In the
+ * campaign the label is the territory and `campaign: true` swaps the panel's
+ * two foot prompts (see `render/debrief.ts`); a skirmish is untouched.
+ */
+function missionInfo(): DebriefInfo {
+  if (campaignBattle) {
+    return {
+      mapLabel: campaignBattle.name,
+      seed: campaignBattle.seed,
+      difficulty,
+      kind: 'TERRITORY',
+      campaign: true,
+    };
+  }
+  return { mapLabel: mapDef(mapChoice).label, seed: mapSeed, difficulty };
+}
 
 /** EVA's opening line, queued through the ordinary message stream. */
 const MISSION_OBJECTIVE_LINE = 'Objective: destroy all enemy structures.';
@@ -177,21 +225,76 @@ let difficulty: AiDifficulty = 'normal';
 let mapChoice: MapChoice = DEFAULT_MAP;
 let mapSeed: number = mapDef(DEFAULT_MAP).seed;
 
-/** Adopt a seed the title resolved, and tag the briefing header with it. */
+/**
+ * Adopt a seed the title resolved, and tag the briefing header with it. This is
+ * the *skirmish* entry point, so it also drops any campaign battle that was
+ * still hanging around (e.g. after `__game.phase('title')` mid-mission).
+ */
 function setMission(choice: MapChoice, seed: number): void {
+  campaignBattle = null;
+  campaignResolved = false;
+  campaign.current = null;
   mapChoice = choice;
   mapSeed = seed >>> 0;
   briefing.setMission(mapDef(choice).label, mapSeed);
 }
 
 /**
+ * Adopt a campaign territory as the next mission. The configuration is plain
+ * data, fully resolved here — *before* any `GameState` exists — so a campaign
+ * battle is exactly as deterministic as a skirmish.
+ */
+function setCampaignMission(cfg: CampaignBattleConfig): void {
+  campaignBattle = cfg;
+  campaignResolved = false;
+  difficulty = cfg.difficulty;
+  mapSeed = cfg.seed >>> 0;
+  briefing.setMission(cfg.name, mapSeed, 'TERRITORY');
+}
+
+/**
  * Build a brand-new skirmish. `state` is reassigned wholesale, so nothing
  * survives a restart: fresh map, entities, fog, credits, AI plan and result.
+ *
+ * A campaign battle takes the identical path — it just hands `initSkirmish` the
+ * territory's extra credits, wave scaling and pre-built defences on top. The
+ * live `difficulty` still wins, so `__game.ai(level)` works mid-campaign.
  */
 function newGame(): GameState {
   const gs = createGameState(mapSeed);
-  initSkirmish(gs, { difficulty });
+  initSkirmish(gs, campaignBattle ? { ...campaignBattle, difficulty } : { difficulty });
   return gs;
+}
+
+/** Begin (or re-begin, on a retry) the battle for a territory. */
+function startCampaignBattle(id: string): boolean {
+  if (!beginBattle(campaign, id)) return false;
+  setCampaignMission(campaignBattleConfig(campaign, id));
+  briefing.reset();
+  saveCampaign(campaignStorage, campaign);
+  return true;
+}
+
+/**
+ * R on a campaign debriefing: another go at the same territory. It counts a
+ * fresh attempt and re-resolves the scaling against whatever the player owns
+ * *now* — which only matters if they somehow gained ground in between, but it
+ * keeps "the config is a function of the current state" true without exception.
+ * `beginBattle` refuses an illegal move, in which case the mission is simply
+ * replayed as-is.
+ */
+function retryCampaignBattle(): void {
+  if (!campaignBattle) return;
+  if (!beginBattle(campaign, campaignBattle.territory)) return;
+  setCampaignMission(campaignBattleConfig(campaign, campaignBattle.territory));
+  saveCampaign(campaignStorage, campaign);
+}
+
+/** Drop out of a campaign battle without a result (T, or a skirmish deploy). */
+function leaveCampaignBattle(): void {
+  campaignBattle = null;
+  campaignResolved = false;
+  campaign.current = null;
 }
 
 let state = newGame();
@@ -213,6 +316,8 @@ let objectiveLinePending = false;
  */
 function restart(level?: AiDifficulty): GameState {
   if (level) difficulty = level;
+  // A campaign battle being rebuilt has not been resolved yet.
+  campaignResolved = false;
   state = newGame();
   api.state = state;
   renderer.buildTerrain(state.map);
@@ -259,12 +364,41 @@ function tick(): void {
       sfx.play('click');
       if (action.kind === 'difficulty') {
         difficulty = action.level;
+      } else if (action.kind === 'campaign') {
+        // V3: leave the skirmish flow for the territory map. Nothing about the
+        // skirmish selection is disturbed — coming back to the title finds the
+        // same sector and difficulty selected.
+        campaignScreen.reset();
       } else {
         // Both 'map' (row click) and 'start' (deploy) carry a resolved seed —
         // for RANDOM, a freshly rolled one. The mission is built at the
         // briefing's deploy, so stashing it here is all the plumbing needed.
         setMission(action.map, action.seed);
         if (action.kind === 'start') briefing.reset();
+      }
+    }
+    phase = nextPhase(phase, action);
+    input.endTick();
+    return;
+  }
+
+  // V3 — conquest map: same contract as the title screen. The sim is frozen,
+  // the screen animates off its own frame counter, and it swallows every event
+  // it sees because the tick returns immediately afterwards.
+  if (phase === 'campaign') {
+    const action = campaignScreen.update(raw, campaign, camera.canvasW, camera.canvasH);
+    if (action) {
+      sfx.play('click');
+      if (action.kind === 'invade') {
+        if (!startCampaignBattle(action.territory)) {
+          // Not a legal move (already owned / not on the front). Stay put.
+          input.endTick();
+          return;
+        }
+      } else if (action.kind === 'reset') {
+        campaign = resetCampaign(campaignStorage);
+        leaveCampaignBattle();
+        campaignScreen.reset();
       }
     }
     phase = nextPhase(phase, action);
@@ -317,12 +451,31 @@ function tick(): void {
     // from the next tick on. The next deploy runs `startMission()` -> `restart()`
     // as usual, so nothing about the finished game survives.
     if (hudSnap.pressed.has('KeyT')) {
+      leaveCampaignBattle();
       phase = 'title';
       input.endTick();
       return;
     }
     const clicked = hudSnap.clicks.some((c) => c.button === 0);
-    if (hudSnap.pressed.has('KeyR') || clicked) {
+    const pressedR = hudSnap.pressed.has('KeyR');
+    if (campaignBattle) {
+      // V3: R retries the territory — but only when the assault failed. After a
+      // win there is nothing left to retry (the ground is yours), so R behaves
+      // like the click and returns to the map, which is what the panel says.
+      if (pressedR && state.result === 'lost') {
+        retryCampaignBattle();
+        restart();
+        input.endTick();
+        return;
+      }
+      if (pressedR || clicked) {
+        leaveCampaignBattle();
+        campaignScreen.reset();
+        phase = 'campaign';
+        input.endTick();
+        return;
+      }
+    } else if (pressedR || clicked) {
       restart();
       input.endTick();
       return;
@@ -347,6 +500,21 @@ function tick(): void {
   removeDead(state);
   updateAi(state);
   updateVictory(state);
+
+  // V3: fold a decided campaign battle into the campaign, exactly once, on the
+  // tick the result is decided — not when the player clicks past the
+  // debriefing, which they may never do. `campaignResolved` is the latch; the
+  // save is written in the same breath, so a reload mid-debriefing already has
+  // the territory.
+  if (campaignBattle && !campaignResolved && state.result !== 'playing') {
+    campaignResolved = true;
+    resolveBattle(campaign, campaignBattle.territory, {
+      won: state.result === 'won',
+      ticks: state.tick,
+      stats: state.stats,
+    });
+    saveCampaign(campaignStorage, campaign);
+  }
 
   // Drain the sim's terrain-repaint queue into the two render-side caches that
   // downsample the map (world terrain layer + radar pane).
@@ -548,6 +716,29 @@ export interface GameApi {
   objectives(show?: boolean): boolean;
   /** Briefing typewriter state, for headless checks. */
   briefing(): { revealed: number; total: number; complete: boolean };
+  /**
+   * V3: the whole conquest campaign — what you own, what you can attack, and
+   * the battle configuration each of the thirteen territories would be fought
+   * under *right now* (difficulty, credit bonus, wave/army scaling, pre-built
+   * defences, threat rating).
+   */
+  campaign(): CampaignReport;
+  /**
+   * V3: start the battle for a territory. The debug-hook counterpart of
+   * confirming on the invade plate — same `startCampaignBattle` path, so it
+   * counts an attempt, saves, and lands on the briefing. False when the move is
+   * not legal (already owned, or not bordering your ground).
+   */
+  campaignInvade(territoryId: string): boolean;
+  /**
+   * V3: force the current battle to a win so the campaign loop can be tested
+   * without playing thirteen matches. The result then travels the *real* path —
+   * `updateVictory` is already sticky, so the next tick folds it into the
+   * campaign and writes the save exactly as a fought win does.
+   */
+  campaignWin(): GameResult;
+  /** V3: wipe the campaign save and start a fresh continent. */
+  campaignReset(): CampaignReport;
 }
 
 const api: GameApi = {
@@ -767,6 +958,9 @@ const api: GameApi = {
     } else if (next === 'briefing' && phase !== 'briefing') {
       briefing.reset();
       phase = 'briefing';
+    } else if (next === 'campaign' && phase !== 'campaign') {
+      campaignScreen.reset();
+      phase = 'campaign';
     } else if (next === 'title') {
       phase = 'title';
     }
@@ -787,6 +981,35 @@ const api: GameApi = {
       total: BRIEFING_CHARS,
       complete: briefing.complete,
     };
+  },
+
+  campaign(): CampaignReport {
+    return campaignReport(campaign);
+  },
+
+  campaignInvade(territoryId: string): boolean {
+    if (!isTerritoryId(territoryId)) {
+      console.warn(`[__game.campaignInvade] unknown territory "${territoryId}"`);
+      return false;
+    }
+    if (!startCampaignBattle(territoryId)) return false;
+    startMission();
+    return true;
+  },
+
+  campaignWin(): GameResult {
+    if (state.result === 'playing') {
+      state.result = 'won';
+      postMessage(state, 'Mission accomplished.', 'info');
+    }
+    return state.result;
+  },
+
+  campaignReset(): CampaignReport {
+    campaign = resetCampaign(campaignStorage);
+    leaveCampaignBattle();
+    campaignScreen.reset();
+    return campaignReport(campaign);
   },
 };
 

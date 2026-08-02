@@ -19,9 +19,12 @@ import type { InputSnapshot } from '../engine/input';
 import { drawPixelText, measurePixelText } from './sprites';
 import { DEFAULT_MAP, mapDef, sectorCode, type BriefingAction } from './title';
 
-/** `MAP ALPHA - SECTOR 0163`. Uppercase + `-` only: 5x7 bitmap font. */
-export function missionTag(label: string, seed: number): string {
-  return `MAP ${label} - SECTOR ${sectorCode(seed)}`;
+/**
+ * `MAP ALPHA - SECTOR 0163`. Uppercase + `-` only: 5x7 bitmap font.
+ * V3: `kind` is 'TERRITORY' for a conquest-campaign battle.
+ */
+export function missionTag(label: string, seed: number, kind = 'MAP'): string {
+  return `${kind} ${label} - SECTOR ${sectorCode(seed)}`;
 }
 
 /** How a line is drawn. Only `text` characters are typed out. */
@@ -118,8 +121,8 @@ export class BriefingScreen {
   mission = missionTag(mapDef(DEFAULT_MAP).label, mapDef(DEFAULT_MAP).seed);
 
   /** Header tag for a mission: `MAP ALPHA - SECTOR 0163`. */
-  setMission(label: string, seed: number): void {
-    this.mission = missionTag(label, seed);
+  setMission(label: string, seed: number, kind = 'MAP'): void {
+    this.mission = missionTag(label, seed, kind);
   }
 
   /** Has the whole briefing been typed out? */

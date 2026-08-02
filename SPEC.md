@@ -1815,3 +1815,347 @@ statement stripped out for the A/B.
    `STRUCTURES SOLD` appears; on a run where you sell nothing it should be absent.
 6. **F1 over the panel** — the help overlay must still draw *over* the debriefing, and the
    objectives readout underneath it should be dimmed by the panel's wash rather than fighting it.
+
+### V3: conquest campaign
+
+Player request: *"pick a country, kinda like risk and take over land, maybe gets harder the more
+land you take over"* — the classic C&C territory map. A thirteen-territory continent, a Risk
+adjacency rule, and a battle configuration that grows with both how deep a territory sits and how
+much of the map you already hold.
+
+New files: `game/campaign.ts` (pure data + logic — no rendering, no `GameState`) and
+`render/campaign.ts` (the map screen). Touched: `game/skirmish.ts`, `game/systems/ai.ts`,
+`render/{title,briefing,debrief}.ts`, `main.ts`. **No system was reordered, no balance number moved,
+and no sim file other than `ai.ts` / `skirmish.ts` was touched at all** — `systems/{victory,combat,
+movement,orders,production,harvest,air,capture,fog}.ts`, `rules.ts`, `state.ts`, `map.ts` and
+`constants.ts` are byte-for-byte unchanged.
+
+---
+
+#### 1. The continent
+
+Thirteen territories in six columns, west (home) to east (the stronghold). **Tier is graph distance
+from home, computed by BFS at module load, never hand-authored**, so the number the scaling reads
+can never drift from the map the player sees. `assertGraph()` runs at load and throws on a
+non-symmetric edge, a dangling id, an unreachable territory, a duplicate seed, or a stronghold that
+is not the deepest node.
+
+| # | territory | id | tier | seed | rock+cliff | adjacent to |
+|---|---|---|---|---|---|---|
+| 1 | **HARROW LANDING** (HQ) | `harrow` | 0 | 1059 | 8.0% | ashen, karst |
+| 2 | ASHEN REACH | `ashen` | 1 | 1326 | 11.6% | harrow, karst, salt, dry |
+| 3 | KARST LINE | `karst` | 1 | 1317 | 12.3% | harrow, ashen, dry, ironwash |
+| 4 | SALT VERGE | `salt` | 2 | 1171 | 13.0% | ashen, dry, cinder |
+| 5 | THE DRY MARCH | `dry` | 2 | 1281 | 13.6% | ashen, karst, salt, ironwash, cinder, vulture |
+| 6 | IRONWASH | `ironwash` | 2 | 1251 | 14.2% | karst, dry, vulture, glass |
+| 7 | CINDER STEPPE | `cinder` | 3 | 1165 | 14.6% | salt, dry, vulture, rift |
+| 8 | VULTURE GAP | `vulture` | 3 | 1359 | 15.0% | dry, ironwash, cinder, glass, rift, blackspine |
+| 9 | GLASS BASIN | `glass` | 3 | 1321 | 15.4% | ironwash, vulture, blackspine, ember |
+| 10 | RIFT COLLAR | `rift` | 4 | 1322 | 16.0% | cinder, vulture, blackspine, crown |
+| 11 | BLACKSPINE | `blackspine` | 4 | 1117 | 16.7% | vulture, glass, rift, ember, crown |
+| 12 | EMBER FLATS | `ember` | 4 | 1074 | 17.5% | glass, blackspine, crown |
+| 13 | **OBSIDIAN CROWN** (stronghold) | `crown` | 5 | 1273 | 18.6% | rift, blackspine, ember |
+
+- **26 undirected edges**, planar in both senses: within the Euler bound (26 <= 3V-6 = 33) *and*
+  geometrically — no two border links between territory centres cross, which is what lets the map be
+  drawn as a continent rather than a tangle. Tier distribution is 1 / 2 / 3 / 3 / 3 / 1 and no edge
+  skips a tier.
+- **The thirteen seeds were validated to exactly the V2 curated-map bar**: both start areas
+  **338/338 tiles clear *and* buildable**, **6** crystal fields, a start-to-start A* path, and every
+  field reachable. They were chosen from a 402-seed scan (400 valid, 2 rejected) by spreading across
+  rock density and rejecting any pair agreeing on more than 70% of their tiles — **minimum pairwise
+  terrain difference 37.9%**. None of them collides with a curated skirmish seed (355/187/84/245).
+- **Terrain gets rockier as you push east.** Rock+cliff cover runs **8.0% at home to 18.6% at the
+  stronghold** and the tier-mean rises monotonically (8.0 -> 12.0 -> 13.6 -> 15.0 -> 16.7 -> 18.6%),
+  so the ground itself reads as harder country the deeper you go. That is a deliberate assignment of
+  validated seeds to tiers, not a generator change.
+
+#### 2. Rules
+
+- **You may attack any enemy territory adjacent to owned land.** Home is owned from the start, so
+  the front is never empty; `attackable(cs)` is the whole rule.
+- **Win -> it becomes yours. Lose -> nothing changes at all** beyond the counters: the territory
+  stays enemy, you keep everything you held, and the same fight can be retried immediately.
+  **Owned land is never lost in v1.** That is a documented simplification — enemy counter-attacks on
+  your own territories are a second mission type, not a variant of this one — and it is what makes
+  the campaign a ratchet rather than a grind.
+- **Own all thirteen -> campaign victory.**
+- Save: `localStorage['crystal-dawn.campaign']`, versioned (`version: 1`) inside the payload.
+  **Anything wrong with it is a fresh campaign, never a throw and never a half-restored one**: bad
+  JSON, a foreign version, unknown territory ids, a missing home territory, or a `"victory"` that
+  does not hold all thirteen (the result is recomputed from `owned`, not trusted). `current` is
+  deliberately dropped on load — a battle that was in progress when the tab closed did not happen.
+  Storage that throws on read *or* write is a session-only campaign, guarded exactly like the mute /
+  objectives preferences.
+
+#### 3. Scaling — the exact formula
+
+`campaignBattleConfig(state, territoryId)` is a **pure function of (land held, depth)** that returns
+an *extended `SkirmishOptions`*, so `main.ts` hands it straight to `initSkirmish` with no
+translation step. `conquered = ownedCount - 1` (home is free); `depth = tier - 1`.
+
+| knob | formula | at the stronghold fought last |
+|---|---|---|
+| `difficulty` | `tier <= 2 -> easy`, `3-4 -> normal`, `5 -> hard` | `hard` |
+| `aiCreditBonus` | `conquered * 400 + tier * 600` | `11*400 + 5*600 =` **7400 cr** |
+| `aiScaling.waveSize` | `1 + conquered*0.04 + depth*0.06` | **x1.68** |
+| `aiScaling.waveInterval` | `max(0.50, 1 - conquered*0.025 - depth*0.04)` | **x0.565** (shorter = more pressure) |
+| `aiScaling.armyCap` | `1 + conquered*0.03 + depth*0.04` | **x1.49** |
+| `aiPrebuilt` | tier 3: plant + 1 tower; tier 4: plant + 2 towers; tier 5: plant + refinery + 3 towers | **5 structures** |
+| `threat` (UI only) | `min(1, depth/4 * 0.65 + conquered/11 * 0.35)` | **0.97 -> OVERWHELMING** |
+
+- **Every term is non-decreasing in both inputs**, so the stronghold fought last is the maximum
+  configuration the campaign can produce **by construction rather than by tuning**. Verified
+  exhaustively over all 12 attackable territories x all 12 possible owned-counts: 0 decreases in
+  land, 0 in depth, and 0 configurations anywhere that exceed the final stronghold on any axis.
+- **The first invasion of a fresh campaign is a plain easy skirmish plus 600 cr** — neutral scaling,
+  no pre-built defences, `LIGHT` resistance.
+- **`AiScaling` does not fork the AI.** Every consumer of the difficulty tuple now reads it through
+  `aiTuning(difficulty, scaling)`, which **returns `AI_DIFFICULTY[level]` itself — the same object,
+  no allocation — whenever the scaling is neutral**. That is the mechanism that makes a skirmish
+  provably unchanged rather than merely intended to be. The three call sites are `nextStructure`
+  (army cap), `stepUnits` (army cap, wave cap) and `stepAttack` (wave growth/cap, intervals);
+  `createAiState` and `aiDifficulty` resolve it too. `firstWave` scales with `waveInterval`, so a
+  deep territory's first wave also lands sooner.
+  Stronghold tuple: `firstWave 3600->2034`, `interval 2200-3000 -> 1243-1695`,
+  `wave 7/3/20 -> 12/5/34`, `armyCap 48->72`.
+- **Pre-built extras go up through the AI's own `findPlacementTile`**, i.e. the same `canPlaceAt`
+  the human's placement ghost uses — buildable terrain, no overlap, no burying a unit, inside the
+  build radius. An extra with nowhere legal to go is skipped rather than forced.
+- **The Power Plant in every pre-built set is not decoration.** Guard towers go offline under
+  `lowPower` (Phase 4) and a deficit halves every build in the base, so towers handed to a
+  ConYard-only opening would sit dark. With the plant in front, tier 3 opens at **+90** power margin,
+  tier 4 at **+80** and the stronghold at **+40** — measured, and no prebuilt battle opens in
+  deficit.
+- **A pre-built Refinery brings its free Harvester** (otherwise it is a building that earns
+  nothing), created directly rather than through `spawnFromBuilding` — pre-placed things are
+  *issued*, not *produced*, so `buildingsBuilt` and `unitsProduced` stay at **0** at t=0, matching
+  how the opening ConYard and free minigunner have always been counted.
+
+#### 4. The map screen
+
+`render/campaign.ts`, same discipline as `title.ts` / `briefing.ts` / `debrief.ts`: render-side only,
+never sees a `GameState`, animates off its own frame counter (the sim is frozen while the phase is
+`'campaign'`, exactly as on the title screen), and `campaignLayout` / `plateLayout` / `plateLines` /
+`pointInShape` / `territoryAt` are **pure**, so the headless smoke asserts geometry directly.
+
+- **`AppPhase` is now `'title' | 'campaign' | 'briefing' | 'playing'`** and `nextPhase` gained one
+  branch: `title --campaign--> campaign --invade--> briefing --start--> playing`. Opening the invade
+  plate, wiping the save and dismissing are all self-transitions. `'playing'` is still terminal —
+  returning to the map from the debriefing is a `main.ts` jump, not a phase action, exactly like
+  the T binding.
+- **Regions are irregular blobs with visible channels between them, plus explicit border links**
+  between adjacent centres. *Deviation from the brief*, which asked for adjacency to be implied by
+  shared borders: abutting polygons in a 13-region hand-authored map either leave hairline seams or
+  need exact shared edge lists, and neither reads as well as a lit link. The links also carry
+  information the borders cannot — a link touching owned ground is drawn lit, an enemy-to-enemy link
+  is background — so the front is legible at a glance.
+- **States**: owned gold fill + gold outline (`HQ` / `HELD` tag), attackable crimson fill with a
+  **pulsing** outline (tier + `n TRIED` tag), unreachable enemy dim crimson. Names are centred on the
+  label anchor and nudged back inside the window — the eastern territories sit against the edge of
+  the continent and OBSIDIAN CROWN would otherwise run off a 480px-wide window (the render smoke
+  caught exactly this).
+- **Invade plate**: `INVADE <NAME>` / `TIER n - <LEVEL> GARRISON` / `ESTIMATED RESISTANCE: <LABEL>` /
+  `ORDER RESERVES: +n CR` / `DEFENCES ALREADY STANDING` / `PREVIOUS ATTEMPTS: n`, with LAUNCH ASSAULT
+  and CANCEL. It is modal over the map: while it is up only its own controls mean anything and
+  anywhere else dismisses. Enter/Space also launches; Escape dismisses.
+- **Progress** is `TERRITORIES n/13   BATTLES n   WON n   FRONTS n` under the header.
+- **RESET CAMPAIGN is double-confirm**: the first click arms it (the label becomes `CONFIRM WIPE?` in
+  red and the footer says so), the second wipes the save. **Any click that is not on the control
+  disarms it**, so an armed wipe can never survive to catch a later, unrelated click.
+- **Title screen.** A `[C] CONQUEST CAMPAIGN` plate below the deploy button (past the sector tag),
+  gold-outlined so it reads as the other mode rather than another skirmish option, plus the `C` key.
+  The skirmish block — SELECT DIFFICULTY, SELECT SECTOR, CLICK TO DEPLOY — is **untouched in order,
+  geometry and behaviour**; only `menuTop`'s reserved block height grew. The map and campaign rows
+  drop to a smaller font face when their label does not fit their plate; the difficulty and deploy
+  rows are unchanged.
+- **Campaign complete** reuses the debriefing's own furniture — same panel, rule, two-column
+  YOU/ORDER table and literally `debriefRows()` — under a green `CONTINENT SECURED`, with
+  `13 TERRITORIES   n BATTLES   TIME mm:ss` from the cumulative counters. `R` starts a new campaign
+  (no double-confirm: the campaign is over, there is nothing to lose accidentally) and `T` returns to
+  the title.
+
+#### 5. Debriefing and wiring
+
+- **`DebriefInfo` gained two optional fields**, `kind` (the word before the label: `MAP` by default,
+  `TERRITORY` in the campaign) and `campaign`. Their presence is the only thing that swaps the
+  panel's two foot prompts, through a new pure `debriefPrompts(info, result)`; `debriefLayout` sizes
+  the panel from exactly what `draw` writes, so a campaign prompt can never overflow. **A skirmish
+  gets byte-identical strings and byte-identical geometry** (`TITLE_PROMPT` is shorter than
+  `RESTART_PROMPT`, so the new `min(fit(a), fit(b))` is the old expression).
+  - won: `TERRITORY SECURED - CLICK TO CONTINUE` / `T - RETURN TO COMMAND`
+  - lost: `ASSAULT REPULSED - CLICK TO WITHDRAW` / `R - RETRY THIS TERRITORY   T - COMMAND`
+- **`R` after a campaign win is not a retry.** The ground is already yours, so R behaves like the
+  click and returns to the map — which is what the panel says. After a *loss* R re-begins the battle
+  (counting a fresh attempt, re-resolving the scaling) and restarts immediately.
+- **The result is folded into the campaign on the tick it is decided, exactly once**, latched by
+  `campaignResolved` and saved in the same breath — not when the player clicks past the panel, which
+  they may never do. A reload mid-debriefing already has the territory.
+- **`campaignBattle` is the mode switch.** Null for every skirmish; when set, `newGame()` passes
+  `{ ...campaignBattle, difficulty }` to `initSkirmish` (so `__game.ai(level)` still works mid-
+  campaign) and `missionInfo()` labels the briefing and the debriefing with the territory. The
+  skirmish entry point `setMission()` clears it, so deploying a skirmish from the title can never
+  inherit a stale campaign battle.
+- **`__game`** gained **`campaign()`** (owned / attackable / result / counters + the live battle
+  configuration for all thirteen territories), **`campaignInvade(id)`** (the debug counterpart of
+  confirming on the plate — same `startCampaignBattle` path), **`campaignWin()`** (force the current
+  battle to a win; `updateVictory` is already sticky, so the result then travels the *real* path) and
+  **`campaignReset()`**. `phase()` accepts `'campaign'`.
+- **Restart hygiene needed no new reset call.** The campaign screen holds no cache — only its
+  selection and reset-arm state, cleared by `campaignScreen.reset()` whenever the map is entered.
+
+#### 6. Deviations / decisions
+
+- **Adjacency is drawn as links, not shared borders** (above). Documented rather than fudged.
+- **Owned land is never lost.** Losing an attack costs an attempt and nothing else.
+- **`aiTuning` returns the shared difficulty object when unscaled.** Object identity is the proof
+  that a skirmish cannot have changed; `isNeutralScaling` is exported so harnesses can assert it.
+- **`AiState.scaling` is one new field** (additive; a skirmish carries `NO_AI_SCALING`).
+  `SkirmishOptions` gained three optional fields (`aiCreditBonus`, `aiScaling`, `aiPrebuilt`), all
+  omitted everywhere except a campaign battle. `AiReport` gained `scaling` and the resolved `tuning`.
+- **The campaign map screen's *input* computes the plate geometry on demand** rather than caching it
+  from `draw`. The first cut cached it, which made a click depend on a frame having been rendered
+  first — the headless harness (which clicks without drawing) caught it, and the same bug would have
+  fired in the browser on a click landing in the frame after a resize.
+- **The home territory has a validated seed it will never play.** Home is owned from the start, so
+  its map is only ever the title/campaign backdrop. Keeping it means all thirteen are held to the
+  same bar and a future "defend your ground" mission has a map to use.
+- **`prebuiltSummary` hides the Power Plant** from the invade plate's copy: it exists to keep the
+  towers lit, and listing it as a threat would be misleading.
+- **The invade plate is reachable only by pointer or Enter/Space** on an already-selected territory;
+  there is no keyboard territory cursor. The map row on the title screen has the same limitation and
+  the same reason (it is a spatial choice).
+
+#### 7. Verified
+
+`npm run build` clean. Seven headless harnesses plus an A/B build, all outside the repo, driving a
+**freshly compiled CommonJS mirror of the real sources** (game + engine + render + `main.ts` itself,
+booted through a stub DOM and a stub `localStorage`, with a recording 2D context and a spy on
+`drawPixelText` so the *actual strings* reaching the screen can be asserted): **895/895 checks**.
+
+- **(a) campaign logic, 107 checks.** Graph: 13 territories, 52 directed / **26 undirected** edges,
+  every adjacency symmetric, no self-loops, no dangling ids, tier distribution `1/2/3/3/3/1`, no edge
+  skipping a tier, unique ids/names/seeds, within the Euler planar bound and **0 geometric link
+  crossings**. Shapes: all 13 label anchors inside their own polygon, all vertices inside the 0..100
+  space, >= 6 vertices each, and **0** shapes swallowing another territory's centre. Rules: a fresh
+  campaign owns only home and fronts on `ashen, karst`; taking ASHEN opens `karst, salt, dry`; an
+  illegal attack counts nothing; a **loss leaves `owned` byte-identical**, keeps the territory
+  attackable and records the attempt; resolving twice is a no-op; a win flips ownership, counts, and
+  folds ticks + both stat blocks into the totals. A legal 12-battle walk reaches **13/13 owned ->
+  `victory`** with nothing left to attack. Persistence: full round-trip incl. records and totals,
+  `current` never restored, **11 corrupt/hostile inputs** (missing, empty, malformed JSON, bare
+  array, number, `null`, no version, wrong version, wrong types, negative and NaN counters) all give
+  a fresh campaign; unknown ids and duplicates dropped; a **false `"victory"` is corrected** and a
+  real one recognised; reset removes the key; and a storage that **throws on get, set and remove**
+  (and a null storage) never throws out.
+- **(b) territory seeds, 45 checks.** All 13: **338/338** start tiles clear + buildable on both
+  sides, **6** crystal fields, a complete start-to-start A* path (1-5 waypoints), 6/6 fields
+  reachable, 163k-189k crystal. Every seed regenerates bit-identically; minimum pairwise terrain
+  difference **37.9%**; rock density **8.0% -> 18.6%** rising monotonically with tier; no collision
+  with a curated skirmish seed.
+- **(c) scaling, 54 checks.** Exhaustive monotonicity over 12 territories x 12 owned-counts x 6 axes:
+  **0** decreases in land held, **0** in depth, and **0** configurations exceeding the final
+  stronghold. Difficulty steps `easy easy normal normal hard`. Stronghold = hard / **+7400 cr** /
+  **x1.68** wave / **x0.565** interval / **x1.49** army / 5 prebuilt / `OVERWHELMING`; first invasion
+  = easy / +600 cr / neutral / none / `LIGHT`. Pre-built placement on **all 12** attackable
+  territories' real maps: every extra found a legal tile, **0** overlapping footprints, **0** buried
+  units, **0** off-map tiles, **0** on unbuildable terrain, **0** power deficits. A configured battle
+  actually opens with them: stronghold seed 1273, hard, credits `5000 + 4000 + 7400`, **3 towers +
+  1 refinery + 1 plant all `ready` at t=0**, the refinery's free harvester present,
+  `buildingsBuilt`/`unitsProduced` still **0**, and the human side untouched. Neutral scaling returns
+  the shared tuple by **object identity**.
+- **(d) full campaign loop, 67 checks.** Driven through the real `main.ts`: `C` on the title opens
+  the map; clicking ASHEN opens the plate without starting anything; clicking the **stronghold from
+  home does nothing**; LAUNCH lands on the briefing, counts the attempt and **saves immediately**;
+  two briefing clicks deploy onto seed 1326 at easy with `5000+600` cr; `campaignWin()` then one tick
+  flips the territory **on the deciding tick**, and **60 further ticks do not re-resolve**; the
+  debrief click returns to the map with the front grown to `karst, salt, dry`. A mid-campaign loss
+  leaves `owned`, `battlesWon` and the **whole attackable set byte-identical**, records the failed
+  attempt, and `R` retries the same seed (attempt 2) and takes it. A **fresh page load on the same
+  storage** restores owned, counters and the front with no battle in progress. The remaining ten
+  territories are taken the same way, stronghold last: **13/13 owned, `victory` fired, 12 battles
+  won**, the save reflects it, cumulative ticks recorded, and the final fight has the most credits,
+  the biggest waves, the shortest wave gap and the most pre-built defences of the whole route (and is
+  the **only** `hard` one). `campaignReset()` empties it and a reload after reset is fresh.
+- **(e) regressions, 31 checks.** Measured against the **pre-V3 sources compiled from git HEAD**,
+  under the identical harness, so the comparison cannot drift the way a hard-coded number from an
+  older phase can. Seed 1337 normal 20 sim-min: inflow **54,928**, **37** units, **2** refineries,
+  waves **04:00 / 06:57 / 09:49 / 12:42 / 16:47**, and a **full sim signature identical** to the
+  pre-V3 build; same for easy and hard at 10 minutes. (These absolute numbers differ from the
+  V2/debriefing SPEC entries because this harness keeps human *units* immortal as well as structures;
+  the load-bearing check is the A/B, not the constant.) The medium-vs-light-tank duel still ends on
+  **125/400 hp** in 309 ticks. A tier-1 campaign battle is in-family with easy/normal: first wave on
+  **easy's own clock (05:30)**, 4 waves, 45,188 cr inflow against easy's 43,908 and normal's 56,126,
+  **23** units — exactly easy's — and a refinery built. The stronghold is visibly a different animal:
+  first wave at **01:41** vs plain hard's 03:00, **8** waves vs 5, **75** units vs 51.
+- **A/B, 6/6 scenarios bit-identical.** The pre-V3 build and the working tree produce the **same
+  sha1 sim signature** (entities, positions, hp, ammo, credits, power, storage, both build queues,
+  the whole stat table, the AI's wave bookkeeping and the next RNG draw) at every 4000-tick mark and
+  at the end, over seeds 1337 (normal 20 min, easy and hard 10 min), 355, 245 and 1273.
+- **(f) render smoke, 583 checks.** Seven window sizes (1920x1080 down to 640x480 plus a tall
+  480x900) x fresh / mid / nearly-done / won, 45 frames each: **nothing throws, no NaN, no
+  negative-size rect**, the map square and both controls are on screen and non-overlapping, **all 13
+  territories hit-test back to themselves** at every size, a point outside the map hits nothing, all
+  13 names plus the header, the progress line, the `HQ` tag and the reset control reach the screen,
+  **every glyph exists in the 5x7 font**, and **no type runs off the window** (the check that caught
+  OBSIDIAN CROWN overflowing at 480px). The invade plate at all seven sizes: panel on screen, LAUNCH
+  and CANCEL non-overlapping and inside the panel, the target named, tier and resistance stated,
+  LAUNCH invades the selected territory and CANCEL dismisses. Reset: first click arms and shows
+  `CONFIRM WIPE?`, second wipes, an unrelated click disarms. Debriefing: skirmish prompts and the
+  `MAP ...` mission line **unchanged**, campaign prompts correct per result, and the panel draws
+  clean and fully on screen across 7 sizes x won/lost x skirmish/campaign with the right prompts
+  read back through the font spy.
+- **(g) perf, 8 checks.** Campaign map at 1920x1080 with all 13 territories **and** the invade plate:
+  **0.054 ms/frame mean, 0.067 p95, 0.206 worst** (16.7 ms budget). `attackable()` +
+  `campaignBattleConfig()` together cost **0.41 us**; a save serialise + deserialise round trip
+  **1.85 us**. Battle perf unchanged: 20 sim-min on seed 1337 normal is **0.0245 ms/tick mean /
+  0.0399 p95** against the pre-V3 build's 0.0266 / 0.0455 (budget 50 ms). The heaviest campaign
+  battle — the stronghold at maximum scaling, 75 units — runs at **0.0574 ms/tick mean, 0.0992 p95**.
+  `initSkirmish` with five pre-built extras costs **0.59 ms** against 0.39 ms plain.
+
+#### 8. Known rough edges
+
+- **Owned land is never lost**, so a campaign can only stall, never go backwards. There is no reason
+  to defend anything you have taken.
+- **`campaignWin()` is a live debug hook in the shipped build**, like every other `__game` helper. It
+  is the only way to test the loop without playing twelve matches, and it is exactly as
+  "cheat-enabled" as `__game.give`.
+- **The campaign has one save slot and no difficulty selection.** The tier drives the AI level, so
+  the title's EASY/NORMAL/HARD buttons do nothing for a campaign battle (`__game.ai(level)` still
+  overrides mid-battle).
+- **The briefing copy is the skirmish briefing verbatim.** Only the header tag changes
+  (`TERRITORY OBSIDIAN CROWN - SECTOR 04F9`); the situation/objective text does not mention the
+  campaign or the territory.
+- **A territory's map never changes.** Retrying a lost assault replays the identical terrain, which
+  is deliberate (it is *that* ground) but means a map you find awkward stays awkward.
+
+#### 9. What to eyeball in the browser
+
+1. **Title screen** — the gold `[C] CONQUEST CAMPAIGN` plate under CLICK TO DEPLOY, and that the
+   skirmish block above it is unchanged at a few window sizes (640x480 is the tight case). Deploy a
+   normal skirmish first and confirm nothing about it moved: same difficulty row, same SELECT SECTOR
+   row, same debriefing prompts.
+2. **The map** — press C. Check the continent reads west-to-east, HARROW LANDING is gold with an
+   `HQ` tag, ASHEN REACH and KARST LINE **pulse** as attackable, everything else is dim crimson, and
+   the border links between owned and enemy ground are lit while enemy-to-enemy links are not.
+   Hover a territory and confirm the outline thickens.
+3. **Invade flow** — click ASHEN REACH, read the plate (`TIER 1 - EASY GARRISON`,
+   `ESTIMATED RESISTANCE: LIGHT`, `ORDER RESERVES: +600 CR`), click LAUNCH ASSAULT, and confirm the
+   briefing header says `TERRITORY ASHEN REACH - SECTOR 052E`. Win it (fastest:
+   `__game.campaignWin()`), check the footer reads **TERRITORY SECURED - CLICK TO CONTINUE**, click,
+   and watch ASHEN REACH **flip to gold** with the front growing to SALT VERGE and THE DRY MARCH.
+   Then lose one on purpose and confirm the footer reads **ASSAULT REPULSED - CLICK TO WITHDRAW**,
+   that `R` retries the same ground immediately, and that the map is exactly as you left it.
+4. **Scaling felt in a real battle** — take five or six territories, then invade a **tier 4**
+   (RIFT COLLAR / BLACKSPINE / EMBER FLATS). At battle start you should already see The Order's
+   **power plant and two guard towers standing**, and the first wave should arrive noticeably before
+   the 04:00 you are used to on normal. Cross-check with `__game.aiInfo()` — `scaling` and `tuning`
+   show the multipliers and the resolved wave clock. Then look at OBSIDIAN CROWN's plate: hard,
+   +7400 cr, `OVERWHELMING`, `DEFENCES ALREADY STANDING`.
+5. **Save survives a reload** — take a territory, then hard-refresh the page and press C: the same
+   ground should still be gold with the same battle counters. Then use RESET CAMPAIGN and confirm it
+   takes **two** clicks (the label turns red first), that a click elsewhere cancels the arming, and
+   that the continent goes back to just HARROW LANDING.
+6. **Campaign complete** — fastest is `__game.campaignInvade(id)` + `__game.campaignWin()` repeatedly
+   (or edit `localStorage['crystal-dawn.campaign']`): the map should be replaced by a green
+   **CONTINENT SECURED** panel with the cumulative YOU/ORDER table and the total campaign time.

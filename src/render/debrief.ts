@@ -33,6 +33,18 @@ export const BEEP_STEPS = 8;
 export const RESTART_PROMPT = 'PRESS R OR CLICK TO RESTART - SAME SECTOR';
 export const TITLE_PROMPT = 'T - RETURN TO COMMAND';
 
+/**
+ * V3: the same panel, different way out. In the conquest campaign a decided
+ * mission returns to the territory map rather than replaying itself, so the
+ * headline prompt says what the click actually does; R still replays the same
+ * territory immediately and T still goes to the title.
+ */
+export const CAMPAIGN_WON_PROMPT = 'TERRITORY SECURED - CLICK TO CONTINUE';
+export const CAMPAIGN_LOST_PROMPT = 'ASSAULT REPULSED - CLICK TO WITHDRAW';
+/** After a loss the fight can be taken again; after a win there is nothing to retry. */
+export const CAMPAIGN_RETRY_PROMPT = 'R - RETRY THIS TERRITORY   T - COMMAND';
+export const CAMPAIGN_ADVANCE_PROMPT = 'T - RETURN TO COMMAND';
+
 const COL = {
   wash: 'rgba(4, 6, 3, 0.78)',
   panel: 'rgba(9, 12, 7, 0.94)',
@@ -104,7 +116,7 @@ export function headlineFor(result: GameResult): string {
 /** `MAP ALPHA - SECTOR 0163   NORMAL   TIME 11:06`. */
 export function missionLine(info: DebriefInfo, tick: number): string {
   return (
-    `MAP ${info.mapLabel} - SECTOR ${sectorCode(info.seed)}   ` +
+    `${info.kind ?? 'MAP'} ${info.mapLabel} - SECTOR ${sectorCode(info.seed)}   ` +
     `${info.difficulty.toUpperCase()}   TIME ${missionTime(tick)}`
   );
 }
@@ -113,6 +125,24 @@ export interface DebriefInfo {
   mapLabel: string;
   seed: number;
   difficulty: string;
+  /**
+   * V3: the word before the label. 'MAP' (the default, and every skirmish) or
+   * 'TERRITORY' for a conquest battle.
+   */
+  kind?: string;
+  /** V3: set for a conquest battle. Its presence is what swaps the prompts. */
+  campaign?: boolean;
+}
+
+/**
+ * The two lines at the foot of the panel. Pure, and the only place the wording
+ * is decided — `debriefLayout` sizes the panel from exactly what `draw` writes.
+ */
+export function debriefPrompts(info: DebriefInfo, result: GameResult): [string, string] {
+  if (!info.campaign) return [RESTART_PROMPT, TITLE_PROMPT];
+  return result === 'won'
+    ? [CAMPAIGN_WON_PROMPT, CAMPAIGN_ADVANCE_PROMPT]
+    : [CAMPAIGN_LOST_PROMPT, CAMPAIGN_RETRY_PROMPT];
 }
 
 // --- layout -----------------------------------------------------------------
@@ -140,6 +170,8 @@ export interface DebriefLayout {
   footY: number;
   foot2Y: number;
   rows: DebriefRow[];
+  /** The two foot prompts this panel was sized for (see `debriefPrompts`). */
+  prompts: [string, string];
 }
 
 /** Widest rendered value in a column set, in font pixels at scale 1. */
@@ -165,6 +197,7 @@ export function debriefLayout(
 ): DebriefLayout {
   const title = headlineFor(result);
   const line = missionLine(info, tick);
+  const prompts = debriefPrompts(info, result);
   const num1 = widestNumber(rows);
   let label1 = 0;
   for (const r of rows) label1 = Math.max(label1, measurePixelText(r.label, 1));
@@ -185,15 +218,15 @@ export function debriefLayout(
   for (let s = 3; s >= 1; s--) {
     const hs = fit(title, s * 2);
     const is = fit(line, Math.max(1, s - 1));
-    const ps = fit(RESTART_PROMPT, s);
+    const ps = Math.min(fit(prompts[0], s), fit(prompts[1], s));
     const colGap = s * 8;
     const tableW = label1 * s + colGap + num1 * s + colGap + num1 * s;
     const cw = Math.max(
       tableW,
       measurePixelText(title, hs),
       measurePixelText(line, is),
-      measurePixelText(RESTART_PROMPT, ps),
-      measurePixelText(TITLE_PROMPT, ps),
+      measurePixelText(prompts[0], ps),
+      measurePixelText(prompts[1], ps),
     );
     const ch =
       hs * 10 + is * 11 + s * 8 + s * 11 + rows.length * s * 9 + s * 8 + ps * 11 + ps * 9;
@@ -259,6 +292,7 @@ export function debriefLayout(
     footY,
     foot2Y,
     rows,
+    prompts,
   };
 }
 
@@ -382,20 +416,20 @@ export class DebriefScreen {
     // player's eye lands on the numbers first.
     const blink = !this.complete || Math.floor(this.frame / 20) % 2 === 0;
     if (blink) {
-      const pw = measurePixelText(RESTART_PROMPT, l.promptScale);
+      const pw = measurePixelText(l.prompts[0], l.promptScale);
       drawPixelText(
         ctx,
-        RESTART_PROMPT,
+        l.prompts[0],
         Math.round(l.panelX + (l.panelW - pw) / 2),
         l.footY,
         l.promptScale,
         COL.bright,
       );
     }
-    const tw = measurePixelText(TITLE_PROMPT, l.promptScale);
+    const tw = measurePixelText(l.prompts[1], l.promptScale);
     drawPixelText(
       ctx,
-      TITLE_PROMPT,
+      l.prompts[1],
       Math.round(l.panelX + (l.panelW - tw) / 2),
       l.foot2Y,
       l.promptScale,
