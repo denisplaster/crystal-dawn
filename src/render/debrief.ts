@@ -45,6 +45,16 @@ export const CAMPAIGN_LOST_PROMPT = 'ASSAULT REPULSED - CLICK TO WITHDRAW';
 export const CAMPAIGN_RETRY_PROMPT = 'R - RETRY THIS TERRITORY   T - COMMAND';
 export const CAMPAIGN_ADVANCE_PROMPT = 'T - RETURN TO COMMAND';
 
+/**
+ * C3: the same idea again for the chrono campaign. A won moment is *secured*
+ * and the click takes you back to the timeline; a lost one is an insertion that
+ * failed, and R travels to the same moment again.
+ */
+export const CHRONO_WON_PROMPT = 'MOMENT SECURED - CLICK TO CONTINUE';
+export const CHRONO_LOST_PROMPT = 'INSERTION FAILED - CLICK TO WITHDRAW';
+export const CHRONO_RETRY_PROMPT = 'R - RETRY THIS MOMENT   T - COMMAND';
+export const CHRONO_ADVANCE_PROMPT = 'T - RETURN TO COMMAND';
+
 const COL = {
   wash: 'rgba(4, 6, 3, 0.78)',
   panel: 'rgba(9, 12, 7, 0.94)',
@@ -132,13 +142,22 @@ export interface DebriefInfo {
   kind?: string;
   /** V3: set for a conquest battle. Its presence is what swaps the prompts. */
   campaign?: boolean;
+  /** C3: set for a chrono battle. Mutually exclusive with `campaign`. */
+  chrono?: boolean;
 }
 
 /**
  * The two lines at the foot of the panel. Pure, and the only place the wording
  * is decided — `debriefLayout` sizes the panel from exactly what `draw` writes.
+ * A skirmish gets byte-identical strings (and therefore byte-identical
+ * geometry) whatever the two campaign flags do.
  */
 export function debriefPrompts(info: DebriefInfo, result: GameResult): [string, string] {
+  if (info.chrono) {
+    return result === 'won'
+      ? [CHRONO_WON_PROMPT, CHRONO_ADVANCE_PROMPT]
+      : [CHRONO_LOST_PROMPT, CHRONO_RETRY_PROMPT];
+  }
   if (!info.campaign) return [RESTART_PROMPT, TITLE_PROMPT];
   return result === 'won'
     ? [CAMPAIGN_WON_PROMPT, CAMPAIGN_ADVANCE_PROMPT]

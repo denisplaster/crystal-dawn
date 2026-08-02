@@ -2360,3 +2360,1118 @@ recording 2D context and a controllable rAF clock: **10,103 / 10,103 checks**.
 5. **Everything else must be identical to V3**: hit-testing, the invade plate and its copy, the
    header and progress line, the double-confirm RESET CAMPAIGN, T MENU, the footer hint, and the
    CONTINENT SECURED panel.
+
+### C1: era framework
+
+The first phase of the **CHRONO CAMPAIGN**: a second campaign in which you time-travel to win
+battles in past and future wars, each with its own unit roster. C1 is the sim-side foundation only —
+era definitions, every new unit/building/weapon/warhead with tuned stats, availability gating, and
+per-era AI compositions. **Art is placeholder** (drawn in the existing vocabulary so nothing renders
+blank and the game is playable now); C2 owns the real per-era art and palettes, C3 the campaign flow.
+
+New file: `game/eras.ts`. Touched: `game/rules.ts`, `game/state.ts`, `game/skirmish.ts`,
+`systems/{production,ai,combat,movement}.ts`, `render/{sprites,renderer,ui}.ts`, `main.ts`.
+No file was restructured, no system was reordered, the tick order is unchanged, and
+`systems/{victory,orders,harvest,air,capture,fog}.ts`, `map.ts`, `constants.ts` and
+`pathfinding.ts` were **not touched at all**.
+
+**The load-bearing guarantee: `silicon` is the shipped game, bit-for-bit.** Every existing mode
+(skirmish, the V3 conquest campaign) runs in the `silicon` era, whose rosters are exactly today's
+type tables and whose AI composition table reproduces the pre-C1 `rollWantedUnit` pool *entry for
+entry, in order*. Verified against the pre-C1 build compiled from git HEAD: identical sim signatures
+across a 20-minute run, three difficulties and four seeds (below).
+
+---
+
+#### 1. The eras
+
+| id | label | year | roster | tower | air pad / unit | scout | palette key |
+|---|---|---|---|---|---|---|---|
+| `trench` | THE GREAT TRENCH, 1917 | 1917 | rifleman, stormtrooper, landship, fieldgun | `mgnest` | — / — | rifleman | `trenchMud` |
+| `steel` | THE STEEL WINTER, 1943 | 1943 | riflesquad, atgun, mediumtank43, heavytank, divebomber | `flaktower` | `airstrip` / divebomber | riflesquad | `steelWinter` |
+| `silicon` | THE CRYSTAL DAWN, 1991 | 1991 | **the shipped nine, unchanged** | `guardTower` | `helipad` / gunship | minigunner | `siliconDesert` |
+| `future` | THE LAST DAWN, 2077 | 2077 | plasmatrooper, hovertank, spidermech, swarmdrone, phaselancer | `lasertower` | `helipad` / swarmdrone | plasmatrooper | `futureNeon` |
+
+- **`harvester` and `engineer` are temporal constants** — available in *every* era, because they
+  travel with the player. That is also what makes the economy identical everywhere: same harvester
+  (1400cr / 600hp / 700 cargo), same refinery (2000cr, free harvester, 1000 storage), same
+  `HARVEST_RATE`, `HARVESTER_CAPACITY` and `CRYSTAL_TILE_AMOUNT`. **No economy number is era-dependent.**
+- **Every other structure is shared**: conyard, powerPlant, refinery, barracks, warFactory,
+  commCenter, silo, sandbag. Only the defence emplacement and the air pad change with the era, which
+  is why the base you build feels like the same base in all four.
+- `EraDef` also carries `flavor` (situation copy, field directives, a tag) for C3/C4 briefings, and
+  `paletteKey` for C2.
+
+#### 2. Gating
+
+`GameState.era` is one additive field, set once by `initSkirmish` from the new
+`SkirmishOptions.era` (default `DEFAULT_ERA` = `'silicon'`) and never written again — the roster is
+resolved at setup, so nothing can change era underneath a running battle.
+
+- **One gate, at the top of `canBuild`:** `if (!eraAllows(state.era, type)) return false;`. Everything
+  below it is the pre-C1 prereq test unchanged. Because `canBuild` is what `enqueue`, the sidebar's
+  grey-out, the AI's `want()` and the AI's composition `add()` all ask, **the era filter reaches every
+  one of them from a single line**. In `silicon` the roster is the whole type table, so the filter is
+  always true and the function behaves exactly as it did.
+- **The sidebar grid** additionally *hides* off-era types: `buildableStructuresFor(state)` /
+  `buildableUnitsFor(state)` filter `BUILDABLE_STRUCTURES` / `BUILDABLE_UNITS` by era, in the type
+  table's own order. The C1 types are appended to `rules.ts` **after** the shipped ones, so silicon's
+  grid is byte-for-byte the pre-C1 list (asserted against the old build's own constants).
+- **`__game.spawn` ignores gating entirely** — it calls `createUnit` / `createBuilding` directly and
+  always did. Spawning a spider mech into 1917 works, which is the point of a debug hook.
+- **The free opening scout is the era's line infantry** (`eraScoutUnit`), `minigunner` in silicon.
+
+#### 3. New sim mechanics (three, all small)
+
+- **`beam` projectile kind.** A zero-travel-time hit: `spawnProjectile` resolves the damage on the
+  tick the shot is fired (at the target's current position — a beam cannot be out-run or intercepted)
+  and pushes a round carrying the new **`Projectile.spent`** flag, `prev` at the muzzle and `pos` at
+  the impact, which lingers `BEAM_LIFE` (4 ticks) purely so the renderer has a line to draw.
+  `updateProjectiles` ages a spent round out and never moves, re-aims or re-damages it. `detonate`
+  was split into `resolveHit` (damage + splash + effect) and `detonate` (`resolveHit` + mark dead);
+  every existing call site is unchanged.
+- **`UnitTypeDef.ignoresTerrainCost`.** Skips the `TERRAIN_COST` multiplier in `movement.ts`.
+  **It is not a passability flag** — a hover tank still pathfinds normally and still cannot cross rock
+  or cliff. False on all sixteen other types.
+- **`airstrip`**, the 1943 pad. Deliberately *not* a new mechanism: it is a helipad variant
+  (`produces: ['air']`, `divebomber.producedAt = 'airstrip'`), and V2's whole rearm cycle works on it
+  unmodified because `air.ts` looks the pad up through `UNIT_TYPES[type].producedAt` rather than by
+  name. 3x2 rather than 2x2, and 900cr rather than 1000.
+
+#### 4. Stat tables
+
+**Units** (all ground unless flagged; `build` is at full power; `prereq` is on top of `producedAt`):
+
+| era | id | name | kind | cost | hp | armor | speed | turn | sight | radius | weapon | turret | build | producedAt | prereq | ammo/rearm | flags |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| trench | `rifleman` | Rifleman | infantry | 80 | 45 | none | 1.6 | 0.6 | 5 | 5 | `boltRifle` | no | 3s | barracks | barracks | — | crushable |
+| trench | `stormtrooper` | Stormtrooper | infantry | 180 | 65 | none | 1.9 | 0.6 | 5 | 5 | `grenade` | no | 5s | barracks | barracks | — | crushable |
+| trench | `landship` | Landship | vehicle | 1400 | 520 | heavy | 2.1 | 0.10 | 5 | 12 | `sixPounder` | no | 14s | warFactory | warFactory | — | crusher |
+| trench | `fieldgun` | Field Gun | vehicle | 800 | 170 | light | 1.5 | 0.14 | 6 | 10 | `fieldHowitzer` | no | 11s | warFactory | warFactory+commCenter | — | — |
+| steel | `riflesquad` | Rifle Squad | infantry | 120 | 60 | none | 1.8 | 0.6 | 5 | 5 | `squadRifles` | no | 3s | barracks | barracks | — | crushable |
+| steel | `atgun` | AT Gun | vehicle | 500 | 140 | light | 1.6 | 0.06 | 6 | 9 | `atRound` | no | 7s | warFactory | warFactory | — | — |
+| steel | `mediumtank43` | Medium Tank | vehicle | 900 | 400 | heavy | 3.0 | 0.16 | 6 | 11 | `tankGun75` | yes | 9s | warFactory | warFactory | — | crusher |
+| steel | `heavytank` | Heavy Tank | vehicle | 1700 | 520 | heavy | 2.2 | 0.12 | 6 | 12 | `tankGun88` | yes | 15s | warFactory | warFactory+commCenter | — | crusher |
+| steel | `divebomber` | Dive Bomber | **air** | 1000 | 170 | light | 5.2 | 0.30 | 8 | 10 | `bombRun` | no | 10s | airstrip | airstrip | **4 / 6s** | isAir |
+| future | `plasmatrooper` | Plasma Trooper | infantry | 220 | 70 | none | 1.9 | 0.6 | 5 | 5 | `plasmaBolt` | no | 4s | barracks | barracks | — | crushable |
+| future | `hovertank` | Hover Tank | vehicle | 1100 | 330 | heavy | 4.4 | 0.26 | 6 | 10 | `pulseCannon` | yes | 10s | warFactory | warFactory | — | crusher, **ignoresTerrainCost** |
+| future | `spidermech` | Spider Mech | vehicle | 2000 | 480 | heavy | 2.4 | 0.14 | 7 | 12 | `twinRailgun` | yes | 16s | warFactory | warFactory+commCenter | — | crusher |
+| future | `swarmdrone` | Swarm Drone | **air** | 350 | 70 | light | 6.0 | 0.40 | 7 | 7 | `droneBolt` | no | 4s | helipad | helipad | **0 (unlimited)** | isAir |
+| future | `phaselancer` | Phase Lancer | vehicle | 1500 | 220 | light | 2.6 | 0.16 | 8 | 10 | `beamLance` | no | 13s | warFactory | warFactory+commCenter | — | — |
+
+**Structures:**
+
+| era | id | name | cost | hp | w x h | sight | power | build | prereq | weapon | produces | standalone |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| trench | `mgnest` | MG Nest | 350 | 340 | 1x1 | 7 | -5 | 8s | barracks | `nestMg` | — | yes |
+| steel | `flaktower` | Flak Tower | 600 | 420 | 1x1 | 8 | -15 | 10s | barracks | `flakBurst` | — | yes |
+| future | `lasertower` | Laser Tower | 800 | 620 | 1x1 | 8 | **-40** | 12s | barracks | `towerLaser` | — | yes |
+| steel | `airstrip` | Airstrip | 900 | 500 | 3x2 | 5 | -10 | 14s | warFactory | — | air | no |
+
+All four are `productionStructure: false`, so **`CHEAPEST_PRODUCTION` is still 400** and the defeat
+rule is still ConYard / Barracks / War Factory (asserted).
+
+**Weapons:**
+
+| id | name | dmg | warhead | range | min | cd | projectile | speed | inacc | targetsAir | vsAir |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| `boltRifle` | Bolt Rifle | 12 | `smallArms` | 4.5 | 0 | 20 | bullet | 24 | 3 | no | 1 |
+| `grenade` | Stick Grenade | 22 | `frag` | 3.2 | 0 | 34 | arc | 11 | 5 | no | 1 |
+| `sixPounder` | 6-Pounder | 30 | `cannon` | 4.5 | 0 | 45 | shell | 14 | 3 | no | 1 |
+| `fieldHowitzer` | Field Howitzer | 90 | `heavyShell` | 7.5 | 2 | 62 | arc | 9 | 9 | no | 1 |
+| `nestMg` | Nest MG | 15 | `smallArms` | 7 | 0 | 11 | bullet | 24 | 2 | no | 1 |
+| `squadRifles` | Squad Rifles | 10 | `smallArms` | 5 | 0 | 11 | bullet | 24 | 3 | **yes** | 0.4 |
+| `atRound` | AT Shot | 50 | `apHigh` | 6.5 | 0 | 45 | shell | 20 | 1 | no | 1 |
+| `tankGun75` | 75mm Tank Gun | 36 | `cannon` | 5.5 | 0 | 30 | shell | 16 | 2 | no | 1 |
+| `tankGun88` | 88mm Tank Gun | 55 | `ap` | 6 | 0 | 42 | shell | 18 | 2 | no | 1 |
+| `bombRun` | Bomb Rack | 125 | `bomb` | 3.5 | 0 | 14 | arc | 12 | 4 | no | 1 |
+| `flakBurst` | Flak Burst | 26 | `flak` | 7.5 | 0 | 9 | bullet | 26 | 2 | **yes** | 1.3 |
+| `plasmaBolt` | Plasma Bolt | 26 | `plasma` | 5 | 0 | 26 | bullet | 14 | 2 | **yes** | 1 |
+| `pulseCannon` | Pulse Cannon | 36 | `plasma` | 5.5 | 0 | 28 | shell | 18 | 2 | no | 1 |
+| `twinRailgun` | Twin Railgun | 48 | `railSlug` | 6 | 0 | 34 | shell | 22 | 2 | no | 1 |
+| `droneBolt` | Drone Bolt | 9 | `plasma` | 4 | 0 | 12 | bullet | 16 | 2 | no | 1 |
+| `beamLance` | Phase Lance | 85 | `beam` | 9 | 2 | 62 | **beam** | 240 | 0 | no | 1 |
+| `towerLaser` | Tower Laser | 42 | `laser` | 8.5 | 0 | 16 | **beam** | 240 | 0 | **yes** | 1 |
+
+**Warheads** (the six shipped ones are untouched):
+
+| id | name | none | light | heavy | structure | splash |
+|---|---|---|---|---|---|---|
+| `frag` | Fragmentation | 1.0 | 0.6 | 0.35 | 0.5 | 34 |
+| `heavyShell` | Heavy Shell | 0.85 | 0.8 | 0.7 | 0.75 | 40 |
+| `apHigh` | AP Shot | 0.25 | 1.0 | **1.15** | 0.5 | 0 |
+| `bomb` | Bomb | 0.75 | 0.9 | 0.8 | 0.75 | 50 |
+| `flak` | Flak | 0.85 | 0.9 | 0.35 | 0.3 | 10 |
+| `plasma` | Plasma | 0.8 | 1.0 | 0.95 | 0.55 | 8 |
+| `railSlug` | Rail Slug | 0.5 | 0.95 | 1.05 | 0.85 | 0 |
+| `beam` | Phase Beam | 0.5 | 1.0 | 1.1 | 0.8 | 0 |
+| `laser` | Laser | 0.9 | 1.0 | 0.8 | 0.5 | 0 |
+
+#### 5. Who can shoot up, per era
+
+Anti-air is `Weapon.targetsAir`, exactly as V2 defined it — no unit is special-cased.
+
+| era | anti-air | aircraft |
+|---|---|---|
+| trench | **none at all** | none |
+| steel | `flaktower` (1.3x), `riflesquad` (0.4x chip) | divebomber |
+| silicon | minigunner (0.5x), rocketSoldier, buggy, gunship, guardTower — **unchanged** | gunship |
+| future | `lasertower`, `plasmatrooper` | swarmdrone |
+
+**Neither the dive bomber's bombs nor the swarm drone's bolt can engage aircraft** (`targetsAir:
+false`): a bomber is not an interceptor, and the drone carries ground-attack munitions. The
+consequence — a drone-vs-divebomber duel is a mutual no-op — is documented rather than special-cased;
+the era's real answer to either is its tower.
+
+#### 6. The AI, per era
+
+Only three things in `ai.ts` became era-aware, and all three are `silicon`-identity by construction:
+
+- **`buildPlanFor(era)`** replaces the fixed `BUILD_PLAN`. Six of its eight entries are shared; the
+  pad entry (`helipad` / `airstrip`, still `only: ['normal','hard']`) is skipped entirely in 1917, and
+  the defence entry asks for the era's own emplacement. Plans are built once per era and cached. In
+  silicon the produced array is entry-for-entry the pre-C1 one.
+- **The composition roll** now walks `ERAS[era].composition` in array order, using the same three tech
+  phases the pre-C1 code branched on (`early` = no war factory, `late` = war factory, `tech` = + comm
+  centre), the same `INFANTRY_SHARE` cut and the same `minWave` gate for siege weapons. Because the
+  rows are walked in order and a zero weight is skipped before `canBuild` is asked, the *pool array* a
+  phase produces in silicon is byte-identical, so the same RNG draw picks the same type.
+- **The air purchase** buys `eraAirUnit(era)` instead of `'gunship'`, and the whole branch is skipped
+  when the era has no aircraft. `AIR_WANTED` per difficulty is unchanged.
+
+| era | composition (early / late / tech weights) |
+|---|---|
+| trench | rifleman 6/2/2 (share-gated), stormtrooper 3/3/3 (share-gated), landship 0/6/4, fieldgun 0/0/3 (wave 2+) |
+| steel | riflesquad 6/2/2, atgun 0/3/3, mediumtank43 0/6/4, heavytank 0/0/5 |
+| silicon | minigunner 6/2/2, rocketSoldier 3/3/3, lightTank 0/6/3, mediumTank 0/0/5, artillery 0/0/3 (wave 2+) — **the pre-C1 pool** |
+| future | plasmatrooper 6/2/2, hovertank 0/6/4, spidermech 0/0/5, phaselancer 0/0/3 (wave 2+) |
+
+**Measured, 20 sim-minutes, seed 1337, normal, immortal human base:**
+
+| era | build timeline | waves (units) | harvested | peak army | first contact |
+|---|---|---|---|---|---|
+| trench | plant 0:08, refinery 0:28, barracks 0:39, factory 1:08, **nest 1:16**, comm 1:44 | 04:00 (5) / 07:08 (7) / 09:59 (16) / 12:32 (27) / 16:55 (34) | 48,710cr | 37 | 04:58 |
+| steel | plant 0:08, refinery 0:28, barracks 0:39, factory 1:08, **strip 1:22, flak 1:33**, comm 2:01 | 04:00 (5) / 07:04 (9) / 10:28 (16) / 13:11 (23) / 15:52 (34) | 57,400cr | 37 | 05:01 |
+| silicon | plant 0:08, refinery 0:28, barracks 0:39, factory 1:08, pad 1:22, tower 1:33, comm 2:01 | 04:00 (5) / 06:57 (10) / 09:49 (17) / 12:42 (26) / 17:01 (34) | 58,800cr | 37 | 04:58 |
+| future | plant 0:08, refinery 0:28, barracks 0:39, factory 1:08, **pad 1:22, laser 1:35**, comm 2:05 | 04:00 (5) / 07:10 (8) / 10:04 (13) / 12:58 (18) / 17:11 (20) | 58,800cr | 27 | 04:58 |
+
+Every era: five waves, first wave on silicon's own 04:00 clock, growing composition
+(1917 finishes on 10 riflemen + 16 landships + 8 stormtroopers; 1943 on 13 medium + 10 heavy tanks +
+4 AT guns + a bomber; 2077 on 7 mechs + 4 hover tanks + 7 lancers), a second refinery, no crash and
+no starvation. **The 2077 army peaks lower (27 vs 34)** because its roster is the most expensive in
+the game — it spends 64,924cr against silicon's 54,867 — which is a real difference in feel, not a
+fault. **1917 pins against its storage ceiling instead** (ends 17,500/17,500cr with 7 silos): its
+roster is the cheapest, so the Phase 7 late-game credit pin fires there rather than late-game
+poverty.
+
+#### 7. Balance, and how each target was met
+
+Silicon numbers are quoted as the reference and **were not changed**.
+
+| target | result |
+|---|---|
+| infantry line fights in silicon's time family | 1v1 at 3 tiles: rifleman **63** ticks, riflesquad **58**, minigunner **63** (reference), plasmatrooper **83** |
+| era heavy armour beats era standard 1v1, 20-45% left | heavytank vs mediumtank43 **214/520 = 41%** (298 ticks); spidermech vs hovertank **206/480 = 43%** (208 ticks). Silicon reference: medium vs light **125/400 = 31%** |
+| era tower kills 3 line infantry keeping >85% | mgnest **94%** (142 ticks), flaktower **95%** (111), guardTower **93%** (151, reference), lasertower **93%** (100) |
+| artillery-class counters era armour, cost-adjusted | 2 fieldguns (1600cr) beat a landship (1400cr) from 8 tiles, 1 surviving on 84%; 4 AT guns (2000cr) beat a heavy tank (1700cr) in 105 ticks, 3 surviving; 2 phase lancers (3000cr) beat a spider mech (2000cr) in 130 ticks, **both** surviving on 69% |
+| divebomber payload ≈ a mediumtank43 | analytic 4 x 125 x 0.8 = **400** = the tank's hp exactly; live run (arc bombs, splash falloff, ±4px scatter) deals **371** and leaves it on **29hp / 7%** |
+| swarmdrone loses 1v1 to a strike aircraft | dies to a gunship in **13 ticks**, leaving it on 97% |
+| 3 swarmdrones beat ground armour with no AA, cost-adjusted | 3 drones (1050cr) kill a hover tank (1100cr) in **156 ticks** without a scratch — the pulse cannon cannot shoot up |
+| ... and AA answers them | lasertower kills 3 drones keeping **91%**; flaktower shoots a dive bomber down in **56 ticks**, keeping 33% |
+| every era with air has AA; trench has neither | asserted from the weapon tables (table in §5) |
+| economy identical in all eras | asserted on the type tables *and* on four full runs: 48.7k-58.8k harvested |
+| hover ignores terrain speed only | 40 tiles of sand: hovertank **218 ticks against an ideal 218**; spidermech 457 against its own 400/460. Passability unchanged |
+
+#### 8. Deviations / decisions
+
+- **`silicon` era names the shipped roster and nothing else.** The four new structures and fourteen
+  new units are appended to the type tables *after* the existing entries, so `BUILDING_TYPE_IDS` /
+  `UNIT_TYPE_IDS` ordering — and therefore the silicon sidebar grid — is unchanged.
+- **`UnitTypeDef` gained one required field**, `ignoresTerrainCost` (false on all nine existing types,
+  matching how `isAir` / `captures` were added). `GameState.era`, `SkirmishOptions.era` and
+  `Projectile.spent` are the other three additive fields. Nothing was renamed.
+- **The spider mech's "dual weapon" is one weapon.** The sim has a single weapon slot per unit type
+  and `Weapon.burst` has been declared-but-unread since Phase 1; `twinRailgun` therefore carries both
+  barrels' damage on one trigger rather than firing two. Flagged rather than faked.
+- **The field gun does not deploy/undeploy** (the C1 brief's call): it is simply slow (1.5 px/tick),
+  fragile and long-ranged.
+- **The 1943 pad is a new structure, not a re-used helipad.** An `airstrip` reads as the era and costs
+  100cr less; the V2 rearm cycle needed **zero** changes because it resolves the pad through
+  `producedAt`.
+- **Beams are hitscan, and hitscan is new.** The alternative (a very fast travelling projectile) would
+  have been interceptable by nothing and identical in effect, but would have needed a real speed and a
+  render path that lags the impact. `spent` is the minimal way to keep a resolved round on screen.
+- **The swarm drone has unlimited ammo** (`ammo: 0`), so `air.ts` is a complete no-op for it: it never
+  returns to a pad, never docks and never rearms. That is what "cheap fragile air" buys.
+- **Trench era towers can only kill infantry.** `nestMg` is `smallArms` (0.2x vs heavy), so an mgnest
+  does nothing to a landship — deliberate, and the reason 1917 wants field guns.
+- **`crusher` / `crushable` remain unimplemented** (a pre-existing gap: the flags have never been read
+  by any system). The new heavies carry them for the day someone implements it, and no era copy claims
+  crushing works.
+- **Silicon artillery still loses to armour cost-adjusted** (2 artillery vs 1 medium tank). That is
+  the shipped behaviour — `arc` shells commit to a point, Phase 7 checklist item 4 — and the harness
+  measures it for reference only rather than changing it.
+
+#### 9. Verified
+
+`npm run build` clean (tsc --noEmit + vite). Six headless harnesses in the scratchpad (a **freshly
+compiled CommonJS mirror** of `src/game` + `src/engine`, plus `src/render/sprites.ts` through a
+software canvas, driven through the real tick order — including main.ts's end-of-tick `state.tick++`,
+which the AI's decision phase depends on), **916/916 checks**. The regression harness compiles a
+**second mirror from git HEAD** and A/Bs against it.
+
+- **(a) silicon regression, 19 checks.** Seed 1337 / normal / 20 sim-minutes: the full sim signature
+  (every entity's position, facing, hp, ammo, cargo, order and target; both build queues; credits,
+  power, storage; the whole stat table; the AI's wave bookkeeping; remaining map crystal) is
+  **identical to the pre-C1 build at every 4000-tick mark and at the end**, as are the wave clock
+  (**04:00 / 06:57 / 09:49 / 12:42 / 17:01**) and gross inflow (**55,254cr**). Same for easy and hard
+  at 10 minutes, and for seeds **355 / 245 / 1273**. The medium-vs-light duel still ends
+  **125/400 hp in 309 ticks** — bit-identical to Phase 4, Phase 7, the stances phase, V2 and V3. The
+  C1 build replays its own seed bit-identically.
+- **(b) gating, 535 checks.** Every era: the roster partitions correctly, harvester + engineer are in
+  all four, every shared structure is in all four, exactly one defence emplacement each, every unit's
+  `producedAt` and every prereq is a structure the era can actually build, and every unit type in the
+  game belongs to some era. `canBuild` returns exactly the era's membership for **all 23 unit types
+  and all 14 structures in all four eras** with a full tech tree standing, `enqueue` refuses every
+  off-era type and leaves the queue empty, and the sidebar lists are era-only. Silicon's two sidebar
+  lists are asserted **against the pre-C1 build's own constants**, in order. `createUnit` /
+  `createBuilding` (the `__game.spawn` path) create off-era types in every era. Over four 15-minute
+  hard runs the AI **fielded only era units and built only era structures** in all four. Defaults:
+  a bare `createGameState` and an option-less `initSkirmish` are both `silicon`; the free scout is the
+  era's line infantry. `CHEAPEST_PRODUCTION` is still 400 and the production set is still
+  `barracks,conyard,warFactory`.
+- **(c) balance, 47 checks.** The table in §7, plus: the beam fires and damages **on the same tick**,
+  deals exactly `85 x 1.1 = 93.5` to heavy armour, is marked `spent`, never damages twice while its
+  visual lingers, and is cleaned up.
+- **(d) AI per era, 87 checks.** The runs in §6. Each era builds refinery / barracks / war factory /
+  two power plants / its own emplacement (and its pad where it has one), harvests **>20,000cr**,
+  launches **5** waves that grow, reaches the human base by **05:01**, fields vehicles rather than only
+  infantry, and is still playing at 20 minutes. Cross-era: identical first-wave clock, wave counts
+  within 0 of silicon's, economies within 0.83-1.00x of silicon's. Easy and hard at 10 minutes in all
+  four eras launch waves and field 23-49 units.
+- **(e) sprites, 218 checks.** `auditSprites()` is now **1176 entries (was 566, +610 exactly as
+  budgeted: 448 hulls + 128 turrets + 16 building frames + 18 icons)**, built in **59ms with 0 under
+  20 opaque px**. Every new unit has 32 hull sprites (thinnest facing 236px, the rifleman) and every
+  new turreted unit 32 turret sprites; every new structure has all four frames; and every sidebar icon
+  is checked for **real ink** (231-863 px that are not the icon plate), so an empty drawer cannot pass.
+  Every type named by every era roster resolves to art.
+- **(f) perf, 10 checks.** 20 sim-minutes, normal, seed 1337 (budget 50 ms/tick):
+  pre-C1 **0.0255 ms mean / 0.0440 p95**; C1 trench **0.0257 / 0.0446**, steel **0.0256 / 0.0416**,
+  silicon **0.0236 / 0.0385**, future **0.0154 / 0.0270**. A 150-unit 2077 battle with 30 beam
+  platforms and 30 drones runs at **0.120 ms mean / 0.267 p95 / 0.86 worst** over 600 ticks
+  (budget 10 ms) with 101 dead.
+
+#### 10. Handoff
+
+**To C2 (art).** Every new type currently renders a *placeholder silhouette* built from the existing
+shape vocabulary — readable, on-grid, house-coloured, non-blank, but not era art.
+
+- **Hulls needing real art (14):** rifleman, stormtrooper, landship, fieldgun / riflesquad, atgun,
+  mediumtank43, heavytank, divebomber / plasmatrooper, hovertank, spidermech, swarmdrone, phaselancer.
+  **Turrets needing real art (4):** mediumtank43, heavytank, hovertank, spidermech.
+  **Structures (4):** mgnest, flaktower, lasertower, airstrip. **Sidebar icons: all 18.**
+- **The era towers share the Guard Tower's gun sprite.** `renderer.drawBuildings` composites
+  `getTowerTurret(player, facing)` for any structure with `turret: true`, so mgnest / flaktower /
+  lasertower currently wear a 1991 autocannon. Giving `getTowerTurret` a type parameter is the natural
+  C2 change; the audit will need the extra entries.
+- **Palette keys** are `EraDef.paletteKey`: `trenchMud`, `steelWinter`, `siliconDesert`, `futureNeon`.
+  `SCHEMES` (the two house colours) is deliberately untouched — C2 should decide whether an era
+  re-tints the terrain ramp (`SPRITE_PALETTE` / `C`), the house schemes, or both. `state.era` is
+  readable from every render entry point.
+- **Beam rendering.** `render/renderer.ts` has a placeholder branch: a 2px cyan line from
+  `p.prev` (muzzle) to `p.pos` (impact) fading over `BEAM_LIFE` = 4 ticks, plus a 4px impact spark.
+  The sim guarantees `prev`/`pos` are the endpoints and `spent === true`. C2 owns the real look
+  (core + bloom + impact flash), and should key colour off the weapon (`p.weapon` is
+  `beamLance` or `towerLaser`).
+- **Bomb rendering.** `bombRun` is an `arc` projectile, so it already draws with the artillery
+  shell/shadow path. `p.weapon === 'bombRun'` distinguishes a falling bomb from a howitzer shell if
+  C2 wants a different sprite; the dive bomber itself wants a dive/pull-up read, which nothing in the
+  sim expresses today.
+- **Drone / bomber chrome.** V2's rotor sprite and ammo pips are keyed on `isAir` and `ammo > 0`, so
+  the dive bomber inherits pips (4 of them) automatically and the swarm drone inherits **none**
+  (unlimited ammo) — check that reads correctly.
+
+**To C3 (campaign flow).** Era travels exactly like difficulty: a module-level choice in `main.ts`
+handed to `initSkirmish` through `SkirmishOptions`.
+
+- `SkirmishOptions.era?: EraId` (default `'silicon'`), consumed by `initSkirmish`, which writes
+  `state.era` **before** placing anything. `main.ts` holds `let era: EraId = DEFAULT_ERA` and
+  `newGame()` passes `{ ...campaignBattle, difficulty, era }`. A chrono mission config only needs to
+  add an `era` field to the object it already hands over — exactly how V3's `CampaignBattleConfig`
+  adds `aiCreditBonus` / `aiScaling` / `aiPrebuilt`, and it composes with all of them.
+- **`__game.era(next?)`** reads `{ current, next, def }` and selects the era for the **next** mission
+  (never mid-battle). It is the debug counterpart of `__game.ai(level)`.
+- `EraDef.flavor` carries `situation` (2-3 lines), `directives` (bullet copy in the briefing's voice)
+  and `tag`, all uppercase and 5x7-font-safe. `BRIEFING_CHARS` is computed from the copy, so a
+  per-era briefing follows automatically. `label` (`THE GREAT TRENCH, 1917`) is the headline and
+  `short` the HUD tag.
+- Nothing about the V3 conquest campaign changed: it opens on `silicon` and is covered by the
+  bit-identical proof.
+
+#### 11. Known rough edges
+
+- **No UI selects an era.** There is no title-screen or briefing affordance; `__game.era('trench')`
+  then deploy is the only path today. That is C3's job by design.
+- **Cross-era spawning is legal and occasionally silly.** `__game.spawn` ignores gating (deliberately),
+  so a 1917 rifleman can be put in front of a gunship it is physically unable to shoot at
+  (`boltRifle.targetsAir` is false). Nothing crashes; it just looks odd.
+- **The era towers all use the Guard Tower gun sprite** (above).
+- **A drone-vs-divebomber duel is a mutual no-op**: neither weapon can engage air.
+- **`Weapon.burst` is still unread** and `crusher`/`crushable` are still unimplemented — both
+  pre-existing, both now carried by C1 types too.
+- **2077 is the expensive era.** Its AI peaks at 27 units against silicon's 34 on the same clock and
+  spends its bank down to nothing; 1917 is the cheap era and pins against its storage ceiling. Both
+  are in family and neither starves, but a C4 balance pass may want the army cap to be value-based
+  rather than count-based (the Phase 6 handoff already flagged this).
+
+### C2: era art
+
+The second phase of the **CHRONO CAMPAIGN**: C1's fourteen units, four turrets, four structures and
+eighteen icons stop being placeholder silhouettes and become real art, and the ground itself becomes
+era-aware — so a 1917 battle *looks* like 1917 and a 2077 battle looks like 2077.
+
+**Render-side only.** Touched: `render/sprites.ts` (the art), `render/renderer.ts` (era tower guns,
+aircraft chrome, the projectile/impact layer), `render/ui.ts` (radar ramp per era) and `main.ts` (the
+palette hook in `restart()`). **No file under `src/game` or `src/engine` was touched at all** —
+verified by diff against a snapshot of the tree taken before this phase started, and by mtime (the
+newest sim file predates the phase). No new dependency, no restructuring, `tsc --noEmit + vite build`
+clean.
+
+---
+
+#### 1. Terrain: one drawer set, four ramps
+
+`TerrainPalette` is the Phase 1 colour table lifted into a type, and the five terrain drawers now
+take one as an argument. Four are declared, keyed **exactly** on `EraDef.paletteKey`:
+`trenchMud` / `steelWinter` / `siliconDesert` / `futureNeon`.
+
+- **`siliconDesert` *is* the shipped table**, value for value, and the shared drawing code is
+  untouched — so 1991 is byte-identical rather than merely intended to be. Proved twice: the 20
+  cached tile sprites hash to the pre-C2 build's `4f783d93…`, and the full composited 2304x2304
+  terrain layer for seed 1337 hashes to `818a1467…` under both builds.
+- **A per-era flourish pass (`terrainStyle`) runs last on each tile**, and `desert` is a no-op that
+  pulls **zero** RNG draws. That is the mechanism behind the byte-identity: silicon's random stream
+  cannot move because nothing new asks it for a number.
+  - **`mud` (1917)** — shell craters: a churned dark ring with water standing in it, 1-2 per ground
+    tile. Ramps are brown-olive grass, brown mud flats in place of sand, earth banks for cliff.
+  - **`winter` (1943)** — snow drifts plus loose flecks, heaviest on rock. Pale grey-green ground,
+    near-white frozen flats, snow lying on the stone.
+  - **`neon` (2077)** — teal and violet mineral glints, with a vein or two through rock. Much darker
+    ground overall.
+- **Crystal is deliberately near-constant.** It is the economy, so the shard ramp is the same green
+  in all four eras and the *style pass is skipped entirely on crystal tiles* — snow or mud lying on
+  top of the shards is exactly what would make them stop reading. Only the ground under them and the
+  glow strength move; `futureNeon` runs the glow at 0.30 alpha against the others' 0.14-0.16, which
+  is the "the crystal here burns hot" line from the era's own briefing copy.
+- **Caching**: one built set per palette in a `Map`, built **lazily** — a silicon-only session never
+  pays for the other three. `initSprites()` clears the map and eagerly builds only the active
+  palette, so boot cost is unchanged (0.67 ms against the pre-C2 0.51 ms).
+- **The hook is `setTerrainPalette(key)` in `main.ts`**, called from the new `applyEraPalette()`
+  immediately **before** `renderer.buildTerrain(state.map)` — at boot and in `restart()`, which is
+  the one path every mission takes (skirmish, campaign battle, R after a defeat). `setTerrainPalette`
+  only swaps which cached set `getTerrainSprite` serves; the dirty-tile API is untouched, and an era
+  change is therefore an ordinary full re-composite. An unknown key falls back to the desert rather
+  than throwing.
+- **The radar follows the ground.** `ui.ts` had one hardcoded RGB-per-terrain table; it is now one
+  table per palette, with `siliconDesert` holding the shipped constants verbatim. The minimap is
+  already invalidated by `sidebar.reset()` on restart, so this needed no new plumbing.
+
+#### 2. Units — 14 hulls + 4 turrets
+
+Same vocabulary as Phase 6 (body-space rectangles rasterised at each of 16 facings, 2px art grid,
+derived shadow + outline, cached per type/player/facing), so nothing about the rendering path
+changed. **Era carries silhouette and material; the house scheme still carries the faction** — every
+sprite keeps its olive/gold or slate/crimson trim exactly where the Phase 6 art puts it, so the
+readability rules hold in all four time periods.
+
+Materials are house-independent and used sparingly: `IRON` / `WOOD` (1917), `GUNMETAL` /
+`WHITEWASH` (1943 winter camo streaks), and the 2077 energy set (`NEON_TEAL` plasma, `NEON_VIOLET`
+phase, `MECH_HOT` reactor orange).
+
+- **1917** — *rifleman*: greatcoat skirt, soup-plate helmet brim, bolt rifle at port with a timber
+  stock and a bolt handle. *stormtrooper*: hunched under a coal-scuttle helmet with a neck guard, a
+  satchel of grenades, one stick grenade cocked back over the shoulder and a trench club in the off
+  hand. *landship*: **the lozenge** — tracks running right around a rhomboid frame that draws in at
+  both ends, a sponson bulging from each flank with its gun raked forward, riveted strakes, a
+  commander's cab and a steering tail. *fieldgun*: big spoked wheels (tyre, cross spokes, hub cap),
+  split timber trail with spades, and a crew shield with a sighting slot.
+- **1943** — *riflesquad*: **three men on one base**, a lead pair up front and a rifleman covering
+  behind with the section radio, so it reads as a section rather than a soldier. *atgun*: low
+  split-trail carriage behind a wide sloped shield. *mediumtank43*: road wheels showing through the
+  track run, sloped glacis, hull machine gun, stowage box. *heavytank*: visibly longer and wider,
+  four-plate engine grill, turret stowage bin. *divebomber*: **inverted gull wing** (inner section
+  kinked forward, outer panels swept back), spatted fixed undercarriage, radial cowling, bomb on the
+  centreline crutch.
+- **2077** — *plasmatrooper*: bulky powered armour with pauldrons, a lit chest core, visor band and
+  reactor pack. *hovertank*: chamfered slab riding a skirt, **no tracks anywhere**, segmented lift
+  glow under the flanks and a brighter rear thruster wash. *spidermech*: four legs of thigh -> knee
+  block -> foot, splayed well outside the chassis, so the body reads as lifted clear of the ground.
+  *swarmdrone*: a stepped diamond with four stub vanes and lit tips — **no rotor**. *phaselancer*:
+  almost all gun, a violet rail running the length of a low chassis fed by two capacitor banks.
+- **Turrets** (`mediumtank43`, `heavytank`, `hovertank`, `spidermech`): rounded cast turret with a
+  coax; angular welded turret with a long 88 and a double-baffle brake; a low disc mount with a lit
+  charge ring; a twin railgun cradle with capacitors burning between the rails.
+
+#### 3. Structures, and the tower gun that was shared
+
+- **`getTowerTurret(player, dir, type = 'guardTower')`** — the C1 handoff's requested change. Each
+  era's emplacement now has its own weapon: a water-cooled MG on a tripod with an ammo can (1917), a
+  **quad flak mount** with four splayed elevated barrels (1943), and an emitter head of focusing
+  rings around a lit lens (2077). The Guard Tower's shapes are unchanged **and keep their cache key**
+  (`t|guardTower|p|d`), so 1991 is the pixel reference it was. `renderer.drawBuildings` passes
+  `b.type`; the audit derives the list from `BUILDING_TYPES[type].turret` rather than a hand-kept one.
+- **mgnest**: a horseshoe of sandbags (three staggered courses) around a dug-in pit with a black
+  embrasure and timber baulks over the back. No metal anywhere on it.
+- **flaktower**: an open steel gun deck on a concrete plinth — corner railings, deck plating,
+  ammunition lockers and a range-finder post, with the quad barrels supplied by the turret sprite.
+- **lasertower**: a slim pylon carrying a focusing crystal. **Two frames, and they are a power state,
+  not an animation**: frame 0 is the cold dark tower, frame 1 is lit with its conduits burning and a
+  wash of light on its own footing. `Renderer.buildingFrame` picks it off
+  `state.players[b.player].lowPower`, which finally puts the Phase 4 rule ("a defence goes offline
+  under `lowPower`") on screen. Constructing forces frame 0, so a half-built tower is dark too.
+- **airstrip**: a graded 3x2 strip with the runway laid **across the middle of the footprint**, so a
+  docked Dive Bomber — which `air.ts` parks on the structure's centre, exactly like a helipad —
+  sits square on the runway. Hangar with an open mouth and a sandbagged revetment at the west end,
+  fuel dump, ground-crew hut and windsock at the east, threshold bars and a dashed centre line.
+- Constructing/selling states are the existing generic paths (`scaffoldOverlay`, the sink-and-fade),
+  so all four new structures inherited them with no work.
+
+#### 4. Aircraft chrome — `airChromeFor(type)`
+
+V2 keyed the spinning rotor on `isAir`, which put a **helicopter disc over a 1943 propeller bomber**
+and over a 2077 drone with no moving parts at all. `sprites.ts` now owns a render-side art table:
+`rotor` (gunship, and the default for anything added later), `prop` (dive bomber) and `none` (swarm
+drone). The propeller is a new 4-frame disc, cached per (player, frame) like the rotor and offset
+along the hull's facing to sit at the **nose** rather than centred on the airframe; it freezes and
+dims while docked, exactly as the rotor does. The sim knows nothing about any of this.
+
+#### 5. Projectiles and impacts
+
+- **Beams are a real laser now.** Four strokes along the muzzle -> impact line the sim already
+  guarantees (`prev` / `pos` / `spent`, `BEAM_LIFE` = 4): a wide soft bloom, a second narrower bloom,
+  a saturated mid stroke and a white-hot core, all fading with `life`. A collapsing 3-frame flare
+  sits on the impact and a dimmer one back at the muzzle. Colour keys off `p.weapon` —
+  **`towerLaser` cuts teal, `beamLance` is violet and 40% heavier on every stroke** (it is a siege
+  weapon), and the Laser Tower's own crystal was re-tinted teal to match the beam it fires.
+- **Bombs tumble.** A `bombRun` `arc` round draws an 8-frame tumbling bomb sprite (fins, body, yellow
+  band, dark nose) instead of the howitzer shell, stepping off `state.tick` and offset by the round's
+  id so a stick of bombs does not tumble in lockstep. The ground shadow is the existing arc path.
+- **Energy rounds** are keyed on the **warhead**, not on a unit type: `plasma` (plasma bolt, pulse
+  cannon, drone bolt) draws a glowing teal bolt with a soft trail, `railSlug` a violet-white slug.
+  Three sizes, picked off the round's damage, so a 9-damage drone bolt is visibly not a 36-damage
+  pulse shell.
+- **Flak** rounds are a dark shell with a burning tracer element rather than a machine-gun streak,
+  and burst into a **grey-white airburst puff** with a hot centre and shrapnel specks.
+- **The impact tracker, and why it exists.** `Effect` carries no weapon id on an explosion, so a flak
+  airburst and a bomb's heavier blast cannot be distinguished from any other splash by the effect
+  alone — and putting a field on `Effect` would have been a sim change. Instead `Renderer` diffs
+  `state.projectiles` **once per tick**, remembers each watched round's *committed* impact point
+  (`Projectile.target`, so the burst lands where the shot lands rather than a tick short), and emits
+  its own effect when the round leaves the array. It is strictly **additive** — the sim's own
+  explosion still plays underneath — so a round the tracker misses degrades to exactly the pre-C2
+  picture. Watched weapons are one table (`TRACKED_IMPACTS`): `flakBurst` -> puff, `bombRun` -> a
+  5-frame shockwave ring sized off the warhead's 50px splash. Capped at 96 live effects and aged in
+  the tracker rather than in `draw`, so a backgrounded tab cannot grow the list.
+- **Muzzle flashes are untouched**, per the brief.
+
+#### 6. Icons
+
+All eighteen redrawn in the Phase 3 schematic style, era-legible at 34px: sandbag courses with a
+black embrasure, four raked flak barrels, a pylon firing a teal beam, a runway with a hangar; a
+brimmed helmet and a bolt rifle, a raised stick grenade, a rhomboid track frame, a spoked wheel
+behind a shield, **three helmets for the rifle squad**, a tall AT shield with a whitewash streak,
+two different tanks (the heavy is bigger and its 88 overhangs the plate), a gull-winged plane seen
+nose-up, a lit visor and chest core, a skirt with a lift cushion, a legged walker with twin rails,
+a diamond with four lit tips, and a violet rail. Four era inks were added to the icon palette
+(`wood`, `earth`, `snow`, `teal`, `violet`); no shipped icon moved.
+
+#### 7. `spriteAudit()` — **1373 entries (was 1176, +197)**
+
+| group | count | note |
+|---|---|---|
+| terrain | 80 (+60) | 4 palettes x 5 types x 4 variants; keys are now `terrain\|<palette>\|t\|v` |
+| unit hulls | 768 | unchanged in count, redrawn in content |
+| turrets | 352 (+96) | 7 unit turrets + **4** tower guns x 2 players x 16 facings |
+| rotor / prop | 8 / 8 (+8) | the propeller disc is new |
+| buildings | 72 (+2) | the Laser Tower's second (lit) frame, both players |
+| icons | 37 | unchanged in count, 18 redrawn |
+| fx | 48 (+31) | 6 beam flares + 3 energy bolts + 4 flak puffs + 10 shockwaves + 8 bomb frames |
+
+The audit switches through all four palettes and **restores the active one**, so running it never
+leaves the world in 1917.
+
+#### 8. Restart hygiene
+
+Two new lines in `restart()`, both beside the existing cache resets: `applyEraPalette()` **before**
+`renderer.buildTerrain` (the palette decides what the composite is made of), and the new
+`renderer.resetFx()`, which drops the render-side impact effects and the rounds being watched for
+them — both are keyed on `state.tick` and on projectile ids, and a new mission restarts both
+numberings. The terrain palette cache itself is keyed on the palette, not on the mission, so it
+deliberately survives; `initSprites()` clears it.
+
+#### 9. Deviations / decisions
+
+- **`game/eras.ts` was not touched**, so `EraDef.paletteKey` is still a `string`. The render side
+  owns the `TerrainPaletteKey` union and validates the string, which keeps the whole phase off the
+  sim. A typo'd key renders the desert instead of throwing.
+- **The impact tracker is a render-side effect system** (above). The honest alternative was
+  `Effect.weapon` on explosions — a one-field sim change — and it was rejected because the render
+  side can already see everything it needs on the projectile.
+- **The Laser Tower's power state re-uses `buildingFrameCount`** rather than adding a new art state.
+  It is the only structure whose "frames" are not an animation, which is documented on both ends.
+- **The radar ramp moved with the ground** (`ui.ts`). Not asked for, but a snowy 1943 map under a
+  desert-coloured radar reads as a bug. Silicon's numbers are verbatim.
+- **The hover tank's lift glow is segmented, not a full outline.** The first cut ran an unbroken
+  bright teal band right around the hull and read as a selection box; it is now four dim patches
+  plus a brighter rear wash and four bright vents.
+- **The dive bomber still has no dive/pull-up read.** Nothing in the sim expresses a dive (the C1
+  handoff said as much); it gets a prop disc and a bomb-carrying silhouette instead.
+- **The title-screen backdrop uses whatever palette the last mission built.** It is composited at
+  boot from the default era and rebuilt on restart, so selecting an era with `__game.era()` and
+  returning to the title shows the *previous* era's ground until the next deploy.
+
+#### 10. Verified
+
+`npm run build` clean (tsc --noEmit + vite). Three headless harnesses in the scratchpad, driving a
+freshly compiled CommonJS mirror of the real `src/render` + `src/game` through a pixel-accurate
+software canvas, plus a **second mirror built from a pre-C2 snapshot of the tree** for the A/B:
+
+- **(a) sprite audit.** **1373 entries, 0 blanks (< 20 opaque px), 0 duplicate keys.** Thinnest entry
+  is the 32px muzzle flash the Phase 6 note already calls out by design (joined by the last beam
+  flare frame at 32px). Thinnest new *entity* art: rifleman hull **308 px**, MG-nest gun **240 px**,
+  dark Laser Tower **328 px**; fattest: landship hull **1700 px**, airstrip **3456 px**. All 18 new
+  icons carry **338-822 px of real ink** (pixels that are not the icon plate), in family with the
+  shipped icons' 355-664.
+- **(b) silicon regression.** The 20 silicon tile sprites hash **`4f783d93…`** under both the pre-C2
+  and the C2 build, and the full composited terrain layer (2304x2304, seed 1337) hashes
+  **`818a1467…`** under both — byte-identical. The other three palettes each hash differently
+  (`a694d047…` / `0d4c4519…` / `a3829cdc…`), i.e. every era really is a different ground.
+  `turret|guardTower|*` keys and shapes are unchanged.
+- **(c) render smoke, 18/18 checks.** For **every era**: the era's whole roster (every unit type x
+  both players, facings, a loaded harvester, a docked aircraft with ammo pips and a rearm bar) and
+  every structure in the roster x both players x **ready / constructing / selling**, with a
+  mixed selection, over 6 interpolated frames at 1280x800 **and** 4 more at 640x480 with fog on, the
+  debug overlay on, and after a `resetFx()`. Alongside them, one live round of **every draw path**:
+  machine-gun tracer, flak shell, plasma bolt, drone bolt, pulse shell, rail slug, AP shell, homing
+  rocket, howitzer arc, bomb arc, and four beams (both weapons, fresh and fading), plus muzzle
+  flashes and explosions at four size classes. **Nothing throws, 0 NaN draw arguments and 0
+  negative-size rects** across all of it. The impact tracker is exercised by removing the tracked
+  rounds mid-run: it emits exactly one flak puff and one bomb blast per era (`bomb,flak`), draws
+  them, and ages them back to **0** on schedule.
+- **(d) perf** (medians of 5, software canvas — a browser is roughly twice as quick; the load-bearing
+  figure is the A/B against the pre-C2 build in the same harness):
+  - boot `initSprites()` **0.67 ms** (pre-C2 **0.51 ms**) — it still eagerly builds one palette only.
+  - force **every** sprite: **57.8 ms for 1373** against the pre-C2 **51.9 ms for 1176** — +11% time
+    for +17% sprites, and that includes building all four terrain palettes.
+  - `buildTerrain` (the full 2304x2304 composite): **22.6 ms** same-era, **22.1 ms** on an era change
+    with the new palette built cold, **21.5 ms** warm. **An era change costs the same as the terrain
+    rebuild that already happens on every restart** — the palette build itself is ~0.45 ms, noise
+    against the composite.
+- **(e) main.ts wiring, 8/8** asserted against the source: `applyEraPalette()` precedes
+  `renderer.buildTerrain` at boot **and** in `restart()`, `resetFx` / `invalidateFog` /
+  `sidebar.reset` are all called on restart, the palette comes from `ERAS[state.era].paletteKey`, and
+  the helper is defined once and used exactly twice.
+- **(f) no sim touched.** `diff -r src/game` against the pre-C2 snapshot is **empty**, and the only
+  files modified in the phase are `src/main.ts`, `src/render/sprites.ts`, `src/render/renderer.ts`,
+  `src/render/ui.ts` and `SPEC.md`.
+
+#### 11. Known rough edges
+
+- **The impact tracker infers detonation from disappearance.** A round that vanishes for any other
+  reason (its target died mid-flight, so it fizzled) still puffs. For flak that is arguably correct —
+  a shell that misses still bursts — and for a bomb it is a blast on empty ground, which is what a
+  jettisoned bomb looks like anyway.
+- **A round whose whole flight fits between two rendered frames is missed**, and only the sim's own
+  explosion plays. Unreachable at any sane frame rate (a bomb falls for several ticks).
+- **The title backdrop lags the selected era** (above).
+- **Terrain palettes are cached forever once built.** Four sets of twenty 24px tiles is ~46 KB of
+  canvas; nothing evicts them.
+- **The trench crater and winter drift passes are per-tile and unaware of their neighbours**, so a
+  crater never spans two tiles and a drift never runs across a boundary. At 4 variants per type it
+  reads as texture rather than as repetition, but a future pass could seed the flourish off the tile
+  index instead.
+- **`Weapon.burst` is still unread** and the spider mech still fires one trigger for two rails, so
+  its twin railgun draws **one** slug (the C1 note stands).
+
+#### 12. What to eyeball in the browser
+
+Pick an era with `__game.era('trench' | 'steel' | 'future')` and then deploy (or press R) — the era
+only takes effect on the **next** mission, and the terrain rebuilds with it.
+
+1. **1917 — THE GREAT TRENCH.** The ground should read as churned brown mud with **shell craters**
+   pocking the grass and standing water in them. Build a couple of **Landships**: the rhomboid track
+   frame with a sponson gun on each flank is the shot — nothing else in the game is that shape. Then
+   a **Field Gun** (spoked wheels, crew shield) and an **MG Nest** (sandbag horseshoe, black
+   embrasure, water-cooled gun on top). Check the riflemen's greatcoats and soup-plate helmets at a
+   24px tile, and that the radar is brown to match.
+2. **1943 — THE STEEL WINTER.** Frosted grey-green ground, near-white frozen flats, **snow lying on
+   the rock**. Build an **Airstrip** and a **Dive Bomber**: watch for the *propeller* disc at the
+   nose (not a helicopter rotor), the inverted gull wing, and — the specific thing to check — that a
+   rearming bomber **parks square on the runway** with its four ammo pips and gold rearm bar. Then
+   watch a bomb run: tumbling bombs on the arc and a heavy shockwave ring on impact. A **Flak Tower**
+   should show an open railed deck with four barrels fanned up, and its bursts should be grey-white
+   airburst puffs in the air rather than ground explosions. Look for the whitewash streaks on the
+   medium and heavy tanks.
+3. **1991 — THE CRYSTAL DAWN.** **Must look exactly as it always has.** Same desert ramp, same radar,
+   same Guard Tower gun, same tanks. If anything here reads as changed, that is a bug.
+4. **2077 — THE LAST DAWN.** Dark ground with teal/violet mineral glints and a **noticeably brighter
+   crystal glow**. Build a **Laser Tower** and then deliberately go into power deficit (sell a power
+   plant): the tower should go **dark** — crystal unlit, conduits out — and light again when power
+   comes back. Fire a **Phase Lancer** (violet beam, heavy, with a flare at both ends) next to a
+   Laser Tower (teal beam, thinner) and confirm they read as different weapons. Check the **hover
+   tank** has no tracks and a segmented glow under its skirt rather than an outline, the **spider
+   mech** stands high on four jointed legs, and the **swarm drone** is a lit diamond with **no
+   rotor**.
+5. **Crystal in every era.** Fly over a crystal field in all four: the shards must stay obviously
+   green and obviously the economy, whatever the ground under them is doing.
+6. **Both houses in each era.** Every new sprite should still carry olive/gold for you and
+   slate/crimson for The Order — era changes the shape and the material, never the faction read.
+7. **The sidebar.** Each era's build grid should be eighteen readable new schematics; the rifle squad
+   icon should show three helmets, and the heavy tank should be visibly the bigger of the two 1943
+   tanks.
+
+### C3: chrono campaign
+
+The third phase of the **CHRONO CAMPAIGN**, and the one the first two were for: C1 built four
+playable eras, C2 gave them their art and their ground, and C3 is the campaign that sends you
+through them. A **timeline map** instead of a continent, thirteen **moments** instead of thirteen
+territories, and a finale — the **ORIGIN MOMENT** — where the gate has torn and The Order fields
+tech from every era at once.
+
+New files: `game/chrono.ts` (pure data + logic — no rendering, no `GameState`) and
+`render/chrono.ts` (the timeline screen). Touched: `game/{state,skirmish,eras}.ts`,
+`game/systems/{production,ai}.ts`, `render/{title,briefing,debrief}.ts`, `main.ts`.
+**`game/campaign.ts` and `render/{campaign,theater}.ts` were not touched at all**, nor were
+`rules.ts`, `map.ts`, `constants.ts`, `pathfinding.ts`, `systems/{victory,combat,movement,orders,
+harvest,air,capture,fog}.ts`, `render/{sprites,renderer,ui,hud}.ts` or `audio/sfx.ts`. Two sim
+files gained one line each and one gained one table; everything else in the phase is new code or
+render-side.
+
+---
+
+#### 1. The thirteen moments
+
+Three per era plus the anomaly. The player starts holding **PRESENT DAY** (1991, the shipped game)
+and unlocks **backward and forward** from it: one arm runs out through 1944 to 1916, the other
+through 2061 to 2077, and the two only meet at the ORIGIN MOMENT.
+
+| # | moment | id | era | year | seed | rock+cliff | gate depth | opened by |
+|---|---|---|---|---|---|---|---|---|
+| 1 | THE SALIENT | `salient` | trench | 1916 | 2400 | 21.0% | 5 | lastpush |
+| 2 | WIRE HARVEST | `wire` | trench | 1917 | 2022 | 19.5% | 5 | lastpush |
+| 3 | THE LAST PUSH | `lastpush` | trench | 1918 | 2861 | 18.2% | 4 | steeltide **or** airfield |
+| 4 | STEEL TIDE | `steeltide` | steel | 1942 | 2251 | 15.5% | 3 | winterline |
+| 5 | THE AIRFIELD | `airfield` | steel | 1943 | 2428 | 14.2% | 3 | winterline |
+| 6 | WINTER LINE | `winterline` | steel | 1944 | 2986 | 12.8% | 2 | desertshield |
+| 7 | DESERT SHIELD | `desertshield` | silicon | 1990 | 2314 | 10.2% | 1 | present |
+| 8 | **PRESENT DAY** (anchor) | `present` | silicon | 1991 | 2747 | 8.8% | 0 | — (held from the start) |
+| 9 | THE GLASS HOUR | `glasshour` | silicon | 1993 | 2054 | 11.5% | 1 | present |
+| 10 | NEON SPRAWL | `neonsprawl` | future | 2061 | 2372 | 16.8% | 2 | glasshour |
+| 11 | THE BROKEN SKY | `brokensky` | future | 2069 | 2274 | 22.2% | 2 | glasshour |
+| 12 | THE LAST DAWN | `lastdawn` | future | 2077 | 2956 | 23.5% | 3 | neonsprawl **or** brokensky |
+| 13 | **THE ORIGIN MOMENT** | `origin` | future | YEAR ZERO | 2439 | 24.8% | 4 | lastdawn **+ 10 moments held** |
+
+- **The unlock graph is directed** — a timeline has a direction of travel — and a moment opens once
+  **any** of the moments leading to it is held. Mostly linear inside an era, with a branch where an
+  era offers two ways on (`winterline -> {steeltide, airfield}`, `glasshour -> {neonsprawl,
+  brokensky}`, `lastpush -> {salient, wire}`) and an **era gate** wherever the chain crosses a time
+  period (`present -> desertshield` stays in 1991, then `desertshield -> winterline` crosses to
+  1943, `airfield -> lastpush` to 1917, `glasshour -> neonsprawl` to 2077). **Gate depth is BFS from
+  the anchor, computed at module load, never hand-authored**, and `assertTimeline()` throws at load
+  on a self-requirement, a dangling id, an unreachable moment, a duplicate id / name / seed, more
+  than one anchor or more than one anomaly, or an era that has the wrong number of moments.
+- **12 battles, exactly like V3.** The anchor is held from the first frame and never fought (it is
+  the map that draws the title backdrop and it keeps a validated seed for a future "defend your own
+  time" mission, the same trade V3 made for HARROW LANDING).
+- **The ORIGIN MOMENT needs `ORIGIN_REQUIREMENT = 10` moments held** *and* THE LAST DAWN taken. Ten
+  of thirteen is the anchor plus nine won battles, so the anomaly is always the end of a campaign
+  rather than a shortcut through the middle of one — but two ordinary moments may still be
+  outstanding when it opens, which is what forces the scaling decision in §3.
+- **The thirteen seeds were validated to exactly the V2/V3 curated bar**: both start areas
+  **338/338** tiles clear *and* buildable, **6** crystal fields, a complete start-to-start A* path,
+  and all 6 fields reachable. They were chosen from a 1000-seed scan (**1000 valid, 0 rejected**) by
+  spreading across rock density and rejecting any pair agreeing on more than 70% of its tiles —
+  **minimum pairwise terrain difference 37.4%**. None collides with a curated skirmish seed
+  (355/187/84/245) or a V3 territory seed (1059…1273).
+- **Rock cover rises with distance from 1991, in years**: **8.8% at PRESENT DAY to 24.8% at the
+  ORIGIN MOMENT**, monotonically across all thirteen. The ground itself gets worse the further from
+  your own time you travel, which is the same trick V3 played west-to-east.
+
+#### 2. Rules
+
+- **Win -> the moment is secured. Lose -> nothing changes at all** beyond the counters: the moment
+  stays enemy, you keep everything you hold, and the same insertion can be retried immediately.
+  **A secured moment is never lost** — the same documented V1 simplification the conquest campaign
+  made, and the same reason: the campaign is a ratchet, not a grind.
+- **Secure all thirteen -> TIMELINE SECURED.**
+- Save: `localStorage['crystal-dawn.chrono']`, versioned (`version: 1`), **its own slot**. The
+  guarantees are V3's, verbatim: **anything wrong with it is a fresh timeline**, never a throw and
+  never a half-restored one (bad JSON, a foreign version, unknown moment ids, a missing anchor, a
+  `"victory"` that does not hold all thirteen — the result is recomputed from `secured`, not
+  trusted). `current` is deliberately dropped on load. A storage that throws on read *or* write is
+  a session-only campaign.
+
+#### 3. Scaling — the exact formula
+
+`chronoBattleConfig(cs, momentId)` is a **pure function of (moments held, era distance)** returning
+an *extended `SkirmishOptions`*, so `main.ts` hands it straight to `initSkirmish`. It reuses the V3
+scaling family — the same knobs, the same `makeAiScaling`, literally the same `resistanceOf` ladder
+imported from `game/campaign.ts` — with one substitution.
+
+`conquered = securedCount - 1` (the anchor is free). **`distance` is era steps from the present**
+(`silicon` 0, `steel` / `future` 1, `trench` 2), *not* gate depth.
+
+| knob | formula | at the ORIGIN MOMENT |
+|---|---|---|
+| `rank` (difficulty) | `distance*4 + conquered`; `<=3` easy, `<=13` normal, else hard | **hard** (rank 23) |
+| `aiCreditBonus` | `conquered * 400 + distance * 900` | **+7100 cr** |
+| `aiScaling.waveSize` | `1 + conquered*0.04 + distance*0.09` | **x1.710** |
+| `aiScaling.waveInterval` | `max(0.50, 1 - conquered*0.025 - distance*0.06)` | **x0.545** (shorter = more pressure) |
+| `aiScaling.armyCap` | `1 + conquered*0.03 + distance*0.06` | **x1.510** |
+| `aiPrebuilt` | fort level `distance + floor(conquered/3)`, capped at 5 | **7 structures** (its own set) |
+| `threat` (UI only) | `min(1, distance/3*0.6 + conquered/11*0.4)` | **1.00 -> OVERWHELMING** |
+
+- **Why era distance and not gate depth.** THE SALIENT is five gates from the anchor and THE LAST
+  DAWN only three; scaling on depth would make 1916 the hardest ground in the game and 2077 an
+  afterthought. The fiction is that the further you travel *in time*, the worse the gate holds, and
+  distance says that directly. Depth is still computed (it proves reachability and it is what the
+  insertion plate calls `GATE DEPTH`), it just does not drive a single number.
+- **Every term is non-decreasing in both inputs.** Verified exhaustively over all 12 ordinary
+  moments x 12 held-counts x 7 axes: **0 decreases** as the timeline is taken, **0** as the era gets
+  further from the present.
+- **The ORIGIN MOMENT is pinned to the maximum rather than read off the live campaign.** It is
+  configured at `MAX_CONQUERED` (11) whatever the player actually holds, and it sits one era step
+  beyond the furthest era (`distance` 3). That is what makes it *provably* the hardest battle the
+  campaign can produce: its count gate lets it be entered with two moments outstanding, so reading
+  the live count would have let a last-fought 1917 moment out-scale the finale on credits. The
+  anomaly does not care how much of the timeline you hold — it fields everything, always. Verified:
+  **0 configurations anywhere exceed it on any axis**, and its configuration does not move between
+  10, 11, 12 and 13 moments held.
+- **The first insertion is a plain easy skirmish**: neutral scaling (`aiTuning` returns the shared
+  `AI_DIFFICULTY.easy` object by identity), **+0 cr**, no pre-built defences, `LIGHT`.
+- **Pre-built defences are the era's own emplacement** — an MG Nest in 1917, a Flak Tower in 1943,
+  a Guard Tower in 1991, a Laser Tower in 2077 — so a fortified moment looks like its own time
+  before a shot is fired. Levels 0-1 are empty, 2-3 are `plant + n towers`, 4-5 are
+  `2 plants + refinery + n towers`. **Two plants at the top**, because the count is sized for the
+  most expensive emplacement in the game (2077's Laser Tower drains 40 each against 1917's 5) rather
+  than per era: measured, **no configured moment opens in a power deficit, in any era**.
+- **The anomaly's garrison is its own set** and is the first thing you see: two plants, a refinery
+  and **one emplacement from every era standing side by side** (`lasertower`, `flaktower`,
+  `guardTower`, `mgnest`) — seven structures, one more than any ordinary level can reach.
+
+#### 4. The temporal anomaly, and the one sim change C3 needed
+
+The ORIGIN MOMENT is fought on 2077's map with 2077's palette, and **the player stays era-locked to
+`future`** (v1; documented). The Order does not.
+
+- **`GameState.anomaly`** is one new additive field, set once by `initSkirmish` from the new
+  `SkirmishOptions.aiAnomaly` and never written again — exactly how C1's `era` behaves, and for the
+  same reason (it is half of the "which types exist" question and nothing may change it under a
+  running battle).
+- **One line in `production.canBuild`**: the C1 era gate becomes
+  `if (!eraAllows(state.era, type) && !(state.anomaly && player !== PLAYER_HUMAN)) return false;`.
+  Because `canBuild` is what `enqueue`, the sidebar's grey-out, the AI's `want()` and the AI's
+  composition `add()` all ask, lifting it there reaches every one of them — **for The Order only**.
+  The human's sidebar lists come from `buildableUnitsFor` / `buildableStructuresFor`, which filter on
+  the era and were not touched, so a 2077 grid is what the player gets. Verified in a live anomaly
+  battle: the human cannot build (or even queue) a landship, an MG nest or a rifleman, and its two
+  sidebar lists are 2077's exactly.
+- **One line in `ai.rollWantedUnit`**: the rows come from the new `ANOMALY_COMPOSITION` table in
+  `eras.ts` instead of `eraDef(state.era).composition`. Same walk, same three tech phases, same
+  `INFANTRY_SHARE` cut, same `minWave` gate on siege weapons — C1 made compositions *data*, so a
+  mixed table needed no plumbing at all. Twelve rows spanning all four eras: rifleman / riflesquad /
+  rocketSoldier / plasmatrooper as infantry, landship / mediumtank43 / mediumTank / hovertank as the
+  line, heavytank / spidermech as the heavies, phaselancer / fieldgun as the siege pair.
+- Measured in a real 20-minute anomaly battle: The Order fielded **rifleman, riflesquad,
+  rocketSoldier, plasmatrooper, landship, mediumtank43, mediumTank, hovertank, heavytank,
+  spidermech, phaselancer, fieldgun and swarmdrone — thirteen types across all four eras**.
+- **`state.anomaly` is false in every other battle in the game**, so both lines short-circuit to the
+  pre-C3 behaviour. Proved by A/B, not by inspection (§7a).
+
+#### 5. The timeline screen
+
+`render/chrono.ts`, same discipline as `title.ts` / `campaign.ts`: render-side only, never sees a
+`GameState`, animates off its own frame counter (the sim is frozen while the phase is `'chrono'`),
+and `chronoLayout` / `chronoBands` / `momentAt` / `nodeCenter` / `chronoLabels` / `insertionLines` /
+`insertionLayout` / `gateState` / `gateTag` are **pure**, so the headless smoke asserts geometry
+directly.
+
+- **`AppPhase` is now `'title' | 'campaign' | 'chrono' | 'briefing' | 'playing'`** and `nextPhase`
+  gained one branch: `title --chrono--> chrono --enter--> briefing --start--> playing`. The two
+  campaign phases are **siblings and neither can reach the other**: the only way across is the
+  title. `ChronoAction` is deliberately its own type rather than a shared "campaign action" — `enter`
+  and `invade` are different verbs into different modes, and keeping them apart is what makes
+  `nextPhase` exhaustive without a mode flag.
+- **Not a continent — a timeline.** A wide (deliberately non-square) rect carrying the 0..100
+  timeline space, divided into **four era bands** washed in that era's C2 ground colour
+  (`trenchMud` brown-olive, `steelWinter` pale grey, `siliconDesert` sand, `futureNeon` dark teal)
+  with headers `1917 - THE GREAT TRENCH`, `1943 - THE STEEL WINTER`, `1991 - THE CRYSTAL DAWN`,
+  `2077 - THE LAST DAWN` (derived from `EraDef.label`, never re-typed). A spine runs down the middle
+  with a tick under every gate; the void behind it is three flat tones, the composited terrain layer
+  drifting **sideways** at 5% (time running past, rather than the conquest map's sea floor) and 96
+  deterministic sparks.
+- **Moments are chrono gates**: a portal ring with an aperture. **Secured** gates burn gold with a
+  filled hub, **open** ones are crimson with a **pulsing** outer ring, **locked** ones sit dark, and
+  the **sealed** anomaly is violet with a bar across it and four spokes so it is never mistaken for
+  an ordinary moment. The anchor carries a solid PRESENT pip. Battle scars (one tick per attempt,
+  capped at five) sit under any moment that has been fought for. It is the same state language the
+  conquest map uses, in this map's own vocabulary.
+- **Streams** are the unlock edges, drawn as gentle cubics that leave a gate horizontally (time is
+  the x axis). A stream out of ground you hold is drawn **lit gold** — a route you can actually
+  travel — and unlit otherwise. `assertTimelineArt()` runs at load exactly like `assertTheater()`
+  and throws if the bands do not tile the timeline without gaps, if a gate is drawn outside its own
+  era's band, or if a stream passes within 4 units of a gate it does not touch (so the map can never
+  lie about what unlocks what).
+- **Insertion plate**: `INSERT INTO <NAME>` / `<year> - <ERA>` / `GATE DEPTH n - <LEVEL> GARRISON` /
+  `ESTIMATED RESISTANCE: <LABEL>` / `ORDER RESERVES: +n CR` / `DEFENCES ALREADY STANDING` /
+  `THE ORDER FIELDS EVERY ERA AT ONCE` (anomaly only) / `PREVIOUS ATTEMPTS: n`, with LAUNCH INSERTION
+  and CANCEL. Modal over the map, Enter/Space launch, Escape dismisses — V3's behaviour exactly.
+  Its geometry is computed **on demand**, never cached from `draw`, so a click never depends on a
+  frame having been rendered first (the V3 lesson, inherited rather than relearned).
+- **Progress** is `MOMENTS n/13   BATTLES n   WON n   GATES n` under the header; **RESET TIMELINE is
+  double-confirm** (first click arms it to `CONFIRM WIPE?` in red, any other click disarms);
+  **T MENU** returns to the title.
+- **Two draw caches**, the V3.1 split: `bands` (washes, spine, band headers, unlit streams) keyed on
+  the map rect's size alone, and `overlay` (gate rings, lit streams, labels, scars) keyed on the size
+  plus a signature of the campaign. Per frame that leaves the void, two `drawImage`s, the pulse and
+  the hover ring.
+- **Label rules.** `chronoLabels` is pure and the harness asserts on it directly. The **era band
+  headers are reserved first**, so a name can never land on `1943 - THE STEEL WINTER`. One name
+  scale for the whole map (it must fit the narrowest band, else the map drops to scale 1). The tag
+  is a second line only when it fits. The reserved rect is the whole block, scars included. Blocks
+  are placed in timeline order, first *below* a gate in the upper lane and *above* one in the lower
+  lane (so labels always fall toward the middle of the rect), then the opposite side, then a
+  deterministic ring search, then an exhaustive grid scan — every candidate clamped inside the map
+  rect before it is tested, so a label can never leave the window. A block that ends up far from its
+  gate gets a leader line. Measured: **585 placements across 9 window sizes x 5 campaign states,
+  0 collisions, 0 off-window, 1 tag drop** (THE ORIGIN MOMENT at 480x900).
+- **Title screen.** An `[X] CHRONO CAMPAIGN` plate in teal, stacked directly under the gold
+  `[C] CONQUEST CAMPAIGN` one so the two read as one "campaigns" block, plus the `X` key. The
+  skirmish block above them is **unchanged in order, geometry and behaviour** (asserted against the
+  pre-C3 build's own `buttons()` output at nine sizes); only `menuTop`'s reserved block height grew,
+  and `MENU_FOOT` (40 px of slack under the last plate) is what keeps the footer hint clear at
+  640x480 — the binding case, where the block now ends 22 px above it.
+- **Briefing.** `briefingLines(momentBriefing | null)` is new and pure. **`null` returns
+  `BRIEFING_LINES` by object identity**, so a skirmish and a conquest battle get the shipped copy
+  with nothing moved; a chrono moment gets `TEMPORAL INSERTION: THE AIRFIELD, 1943` as the headline,
+  `CHRONO GATE - THE STEEL WINTER, 1943` under it, and the era's **own** `flavor.situation` and
+  `flavor.directives` — the copy C1 wrote for exactly this. The anomaly adds an `ANOMALY` block
+  saying the gate has torn and The Order is fielding all four eras. `BRIEFING_CHARS` is unchanged
+  and still exported; the typewriter now measures against `briefing.total`, which is the *active*
+  copy set.
+- **Debriefing.** `DebriefInfo` gained one optional field, `chrono`, whose presence swaps the two
+  foot prompts through the existing pure `debriefPrompts`. A skirmish and a conquest battle get
+  byte-identical strings **and byte-identical geometry** (asserted against the pre-C3 build).
+  - won: `MOMENT SECURED - CLICK TO CONTINUE` / `T - RETURN TO COMMAND`
+  - lost: `INSERTION FAILED - CLICK TO WITHDRAW` / `R - RETRY THIS MOMENT   T - COMMAND`
+  - the mission line reads `MOMENT THE AIRFIELD - SECTOR 097C   NORMAL   TIME 11:06`
+- **Campaign complete** reuses the debriefing's furniture again — same panel, rule, two-column
+  YOU/ORDER table and literally `debriefRows()` — under a green **TIMELINE SECURED**, with
+  `13 MOMENTS   n BATTLES   TIME mm:ss`. `R` starts a new timeline, `T` returns to the title.
+
+#### 6. Wiring, and how the three modes stay apart
+
+`main.ts` holds a **parallel** set of variables to V3's rather than a shared abstraction:
+`chronoStorage` / `chrono` / `chronoBattle` / `chronoResolved`, `ChronoScreen`, and
+`startChronoBattle` / `retryChronoBattle` / `leaveChronoBattle` mirroring their conquest
+counterparts one function at a time.
+
+- **Mutual exclusion is enforced at the three entry points.** `setMission` (skirmish) clears both
+  battle configs, `setCampaignMission` clears the chrono one, `setChronoMission` clears the campaign
+  one — and each also clears the other campaign's `current`. `newGame()` therefore has exactly one
+  live branch: `chronoBattle ? {...chronoBattle, difficulty} : campaignBattle ? {...campaignBattle,
+  difficulty, era} : {difficulty, era}`. **A chrono battle carries its own era**, so the
+  module-level `era` (what `__game.era()` selects for skirmishes) is deliberately not applied to it.
+- **The result latch is per mode.** Two independent `if (xBattle && !xResolved && result !==
+  'playing')` blocks run after `updateVictory`, and only one can ever fire in a given battle. That is
+  what makes each campaign's save untouched by the other's battles — verified both directions by
+  byte-comparing the save file across a full battle of the other mode.
+- **Restart hygiene needed no new cache reset.** The timeline screen holds only its selection and
+  reset-arm state, cleared by `chronoScreen.reset()` whenever the map is entered; `restart()` gained
+  one line (`chronoResolved = false`) beside V3's.
+- **`__game`** gained **`chrono()`** (secured / enterable / the origin gate's shortfall / counters +
+  the live battle configuration for all thirteen moments), **`chronoInvade(id)`**, **`chronoWin()`**
+  and **`chronoReset()`**, mirroring V3's four exactly. `phase()` accepts `'chrono'`.
+
+#### 7. Verified
+
+`npm run build` clean (tsc --noEmit + vite build). Seven headless harnesses in the scratchpad,
+driving a **freshly compiled CommonJS mirror of the real sources** (game + engine + render +
+`main.ts` itself, booted through a stub DOM and a stub `localStorage`, with a recording 2D context, a
+driven rAF clock and a spy on `drawPixelText` so the *actual strings* reaching the screen can be
+asserted), plus a **second mirror compiled from git HEAD** for the A/B: **4,854 / 4,854 checks**.
+
+- **(a) chrono logic, 202 checks.** Graph: 13 moments, 3/3/3/4 per era, one anchor, one anomaly,
+  unique ids / names / seeds, every requirement resolving, every moment reachable from the anchor,
+  gate depths `0/1/1/2/2/3/3/3/4/4/5/5`, era distances `0/1/1/2` and the anomaly strictly beyond all
+  of them. Rules: a fresh timeline holds only the anchor and fronts on `desertshield, glasshour`;
+  taking DESERT SHIELD opens `glasshour, winterline`; an illegal move counts nothing; a **loss leaves
+  `secured` byte-identical**, keeps the moment enterable and records the attempt; resolving twice is
+  a no-op; wins and losses both fold ticks and both stat blocks into the totals. The origin gate is
+  walked moment by moment: it **never** opens under ten held, it needs THE LAST DAWN as well, and it
+  opens at **exactly** ten — including the case with two moments still outstanding, and the case
+  where the graph condition is met early and the count holds it shut (`SEALED - 4 MORE`). A legal
+  12-battle walk reaches **13/13 -> `victory`**. Persistence: full round-trip, `current` never
+  restored, **12 corrupt/hostile inputs** all give a fresh timeline, a **false `"victory"` is
+  corrected** and a real one recognised, unknown ids and duplicates dropped, reset removes the key,
+  and a storage that **throws on get, set and remove** (and a null storage) never throws out.
+- **(b) chrono seeds, 125 checks.** All 13: **338/338** start tiles clear + buildable on both sides,
+  **6** crystal fields, a complete start-to-start A* path (1-6 waypoints), 6/6 fields reachable,
+  154k-181k crystal. Every seed regenerates bit-identically; minimum pairwise terrain difference
+  **37.4%**; rock density **8.8% -> 24.8%** rising monotonically with distance from 1991; PRESENT DAY
+  is the most open ground and the ORIGIN MOMENT the most broken; **no collision with any V2 curated
+  seed or any V3 territory seed**.
+- **(c) scaling + anomaly, 163 checks.** Exhaustive monotonicity over 12 moments x 12 held-counts x
+  7 axes: **0** eases with land, **0** with distance, **0** configurations exceeding the ORIGIN
+  MOMENT, and the anomaly's own configuration identical at 10/11/12/13 held. First insertion =
+  easy / +0 cr / `LIGHT` / neutral scaling **by object identity**. Pre-built placement on every
+  configured moment's real map: every extra found a legal tile, **0** overlapping footprints, **0**
+  off-map tiles, **0** power deficits, `buildingsBuilt` / `unitsProduced` still **0** at t=0, every
+  extra `ready`, `state.era` and `state.anomaly` matching the moment every time. In a live anomaly
+  battle: `state.anomaly` set, era `future`, The Order opening on `5000 + 4000 + 7100`, and over 20
+  sim-minutes it fielded **13 unit types across all four eras**; meanwhile the human's two sidebar
+  lists are 2077's exactly, `canBuild` refuses it every off-era type and `enqueue` leaves its queue
+  empty. An ordinary moment keeps the gate: no cross-era building, era roster intact.
+- **(d) the whole loop through the real `main.ts`, 161 checks.** `X` on the title opens the timeline
+  (with both campaign plates drawn); the header, progress line, all four era band headers, every gate
+  name, T MENU and RESET TIMELINE reach the screen. Clicking a locked gate, the sealed anomaly or a
+  held moment **starts nothing**; clicking an open one opens the plate **without counting an
+  attempt**; LAUNCH lands on the briefing, counts the attempt and **saves immediately** while the
+  conquest save is never written. The briefing carries `TEMPORAL INSERTION: DESERT SHIELD, 1990`, the
+  era sub-head, the era's situation copy and the era's directives; two clicks deploy onto **seed 2314
+  at easy in `silicon` with the silicon palette applied**. `chronoWin()` + one tick resolves **on the
+  deciding tick**, and **60 further ticks do not re-resolve**; the debrief reads `MOMENT SECURED` and
+  the click returns to the timeline with the front grown. A loss leaves `secured` byte-identical,
+  records the attempt, reads `INSERTION FAILED`, and **`R` retries the same moment in the same era**.
+  Cross-mode: a conquest battle fought mid-chrono leaves the **chrono save byte-identical**, and a
+  chrono battle fought mid-conquest leaves the **conquest save byte-identical**; a skirmish writes
+  neither and still shows the shipped debrief prompt. The remaining nine moments are then taken
+  through `chronoInvade`, each **in its own era on its own seed**, the anomaly opens at twelve held,
+  its battle opens with **seven Order structures and one emplacement from each era standing**, and
+  the finale fires: **13/13 secured, `victory`, 12 battles won**, `TIMELINE SECURED` drawing with the
+  debriefing table. `chronoReset()` empties it and removes the key while leaving the continent alone,
+  and three live window resizes redraw with **0 NaN and 0 negative-size rects** across the whole run.
+- **(e) regressions, 242 checks.** Measured against the **pre-C1/C2/C3 sources compiled from git
+  HEAD**, under the identical harness. Seed 1337 normal 20 sim-min: **full sim signature identical**
+  (`sha1 2eef7c73c540`) at every 4000-tick mark and at the end, same wave clock
+  (**04:00 / 06:54 / 09:46 / 13:01 / 16:54**), same **54,857 cr** inflow, same 36 units, same 2
+  refineries; identical again for easy and hard at 10 minutes and for seeds **355 / 245 / 1273**.
+  The C3 build replays its own seed bit-identically. The medium-vs-light-tank duel ends
+  **125/400 hp in 310 ticks** under both builds. The whole V3 conquest logic set re-asserted
+  verbatim: 52 directed / **26 undirected** edges, symmetry, no self-loops, tier distribution
+  `1/2/3/3/3/1`, no edge skipping a tier, **the id/seed list asserted verbatim**, the fresh front, a
+  loss changing nothing, resolve-twice being a no-op, first-invasion (easy/+600/LIGHT) and stronghold
+  (hard/+7400/5 prebuilt/x1.68/x0.565/x1.49/OVERWHELMING) configs, and 8 corrupt inputs. All
+  **nineteen** `nextPhase` branches including the four new ones and the two cross-mode rejections.
+  The skirmish debriefing's prompts, mission line and **panel geometry at three sizes** are identical
+  to the pre-C3 build, as are the V3 prompts; the skirmish briefing copy and `BRIEFING_CHARS` are
+  identical; and silicon's two sidebar lists still equal the pre-C1 constants, in order.
+- **(f) render smoke, 3,949 checks.** Nine window sizes (640x480 up to 2560x1440 plus a tall
+  480x900) x five campaign states (fresh / mid-with-scars / origin-sealed / nearly-done / complete):
+  **585 label placements, 0 collisions, 0 off-window, 0 landing on an era band header, every glyph in
+  the 5x7 font**. **900 frames, 0 throws, 0 NaN, 0 negative-size rects**, with hover, an open plate
+  and an armed reset exercised, and every gate name plus the header, progress line and both controls
+  read back through the font spy. Hit testing: **every gate hit-tests back to itself at every size**,
+  including a ring of samples inside each ring; no two gates overlap; points off the map hit nothing;
+  the ring is never smaller than 6 px. The plate at all nine sizes: panel on screen, LAUNCH and CANCEL
+  non-overlapping and inside the panel, the target named, resistance stated, and the anomaly's plate
+  carrying both its warnings. Routing: an open gate selects, CANCEL dismisses, LAUNCH enters, a
+  locked or held gate does nothing, RESET is double-confirm and an unrelated click disarms it, T MENU
+  leaves. Title: **eleven buttons at every size with 0 overlaps**, all on screen and clear of the
+  footer hint, each hit-testing back to itself, both campaign plates drawing their labels and
+  returning the right action, a click outside still deploying — and the **skirmish buttons' sizes and
+  order identical to the pre-C3 build** at all nine sizes.
+- **(g) perf, 12 checks.** Timeline screen at 1920x1080: **0.034 ms/frame mean, 0.092 p95, 0.291
+  worst** against the theater map's 0.043 / 0.070 / 0.203 in the same harness — in family, and inside
+  the 16.7 ms budget with room to spare (0.061 with the insertion plate up; 0.029 at 640x480).
+  `enterable()` + `chronoBattleConfig()` together cost **0.31 us**, a save round trip **2.5 us**, and
+  `chronoLabels()` **1.7 us** (paid on a cache miss, not per frame). Battle perf unchanged: 20
+  sim-min on seed 1337 normal runs at **0.0213-0.0233 ms/tick** on the C3 build against
+  **0.0218-0.0232** on the pre-C3 one over five interleaved runs — inside run-to-run noise, which is
+  what "two short-circuiting boolean reads" predicts. The heaviest chrono battle, the anomaly at
+  maximum scaling, runs at **0.033 ms/tick mean, 0.049 p95**; `initSkirmish` with its seven pre-built
+  extras costs **0.64 ms** against 0.37 ms plain.
+
+#### 8. Deviations / decisions
+
+- **Scaling reads era distance, not gate depth** (§3). Documented rather than fudged: depth is still
+  computed, asserted and displayed, it just is not the difficulty term.
+- **The ORIGIN MOMENT's configuration is pinned to the maximum** rather than read off the live
+  campaign (§3). The alternative — letting it float with `securedCount` — is what would have let a
+  late 1917 fight out-scale the finale, because the count gate lets the anomaly open with two moments
+  outstanding.
+- **The player is era-locked even in the anomaly.** Only The Order fields mixed tech in v1. Letting
+  the human build four eras' worth of hardware is a different (and much bigger) balance question —
+  the sidebar would need paging, and every era's counters would have to hold against every other
+  era's units. Flagged for a later phase.
+- **The anomaly's AI keeps 2077's build plan and 2077's aircraft.** `buildPlanFor(era)` and
+  `eraAirUnit(era)` are untouched, so it builds Laser Towers and flies Swarm Drones; the mixed
+  roster is the *army composition* plus whatever the pre-built set puts on the map. Widening the
+  plan too would have meant a second era-aware code path in `ai.ts` for one battle.
+- **A secured moment is never lost**, exactly like V3's territories. Losing an insertion costs an
+  attempt and nothing else.
+- **The anchor has a validated seed it will never play**, the same trade V3 made for HARROW LANDING.
+- **`X` opens the chrono campaign**, not `T` (which already means "menu" on both campaign maps) and
+  not `C` (the conquest campaign). It is arbitrary but unambiguous, and it is on the plate.
+- **`ChronoAction` is a separate type from `CampaignAction`** (§5), and `game/chrono.ts` imports
+  `resistanceOf` / `CampaignStorage` / `defaultCampaignStorage` from `game/campaign.ts` rather than
+  copying them. Shared *functions*, separate *state* — which is the line that makes "each campaign's
+  save is untouched by the other's battles" easy to prove.
+- **The timeline map rect is not square** (`chronoLayout` returns `mapW` / `mapH` and separate `ux` /
+  `uy`), unlike `campaignLayout`. A timeline is wide; forcing it square would have wasted half the
+  window and squashed the era bands.
+- **The two campaigns share the title's difficulty buttons and ignore them.** The moment's distance
+  and the held count drive the AI level, exactly as the conquest tier does; `__game.ai(level)` still
+  overrides mid-battle.
+
+#### 9. Known rough edges
+
+- **Neither campaign can be entered from the other** — the title is the only way across. That is by
+  construction (§5) but it does mean two clicks to switch modes.
+- **`chronoWin()` is a live debug hook in the shipped build**, exactly as `campaignWin()` is.
+- **The chrono campaign has one save slot and no difficulty selection**, the same limitation V3 has.
+- **A moment's map never changes.** Retrying a failed insertion replays the identical terrain — it is
+  *that* ground, at *that* moment — but a map you find awkward stays awkward.
+- **The title backdrop still lags the selected era** (the C2 note stands), so entering the timeline
+  from a fresh boot shows 1991's ground behind the void whatever moment you are about to fight.
+- **THE ORIGIN MOMENT drops its year tag at 480x900** — the one tag drop in 585 placements. The gate
+  ring, the name and the sealed bar all still read.
+- **The anomaly is the only mixed-roster battle in the game.** There is no skirmish switch for it;
+  `__game.chronoInvade('origin')` (with the timeline far enough along) is the only way to see it.
+
+#### 10. What to eyeball in the browser
+
+1. **Title screen** — the teal `[X] CHRONO CAMPAIGN` plate under the gold `[C] CONQUEST CAMPAIGN`
+   one. Check at **640x480** that both plates are on screen, that the footer hint is not crowded, and
+   that the skirmish block above them (SELECT DIFFICULTY, SELECT SECTOR, CLICK TO DEPLOY, the sector
+   tag) is exactly where it was. Deploy a normal skirmish and confirm nothing about it moved.
+2. **The timeline, fresh** — press `X`. It should read as **time running left to right**: four era
+   bands in their own ground colours with `1917 - THE GREAT TRENCH` … `2077 - THE LAST DAWN` along
+   the top, a spine with a tick under every gate, and thirteen rings on it. PRESENT DAY should be
+   gold with a solid core in the middle of the 1991 band; DESERT SHIELD and THE GLASS HOUR should
+   **pulse** either side of it; everything else dark. THE ORIGIN MOMENT sits alone at the top right
+   with four spokes and a bar across it, tagged `YEAR ZERO - 9 MORE`.
+3. **An insertion plate** — click THE GLASS HOUR. Read `INSERT INTO THE GLASS HOUR`,
+   `1993 - THE CRYSTAL DAWN`, `GATE DEPTH 1 - EASY GARRISON`, `ESTIMATED RESISTANCE: LIGHT`. Click
+   LAUNCH INSERTION and confirm the briefing header says
+   `TEMPORAL INSERTION: THE GLASS HOUR, 1993` with 1991's situation copy under it.
+4. **An era-correct battle** — fastest is `__game.chronoInvade('airfield')` after taking WINTER LINE
+   (or just `__game.chronoInvade('winterline')` then `__game.chronoWin()` and on). The battle must
+   open on **snow** with a 1943 sidebar (Rifle Squad, AT Gun, two tanks, Airstrip, Flak Tower) and the
+   briefing must have said `TEMPORAL INSERTION: THE AIRFIELD, 1943`. Then do 1917 and 2077 and check
+   the ground, the radar and the roster change with them.
+5. **Mid-campaign timeline** — take five or six. The gold should read as **two arms spreading out of
+   1991 in opposite directions**, with the streams out of held gates lit and the pulse jumping to the
+   new front. Lose one on purpose and check the `n TRIED` tag and the scar ticks under the name.
+6. **The ORIGIN gate** — with nine or ten moments held, watch the anomaly go from `LOCKED` to
+   `YEAR ZERO - n MORE` (violet, barred) to **open and pulsing** at ten. Its plate should read hard,
+   `+7100 CR`, `OVERWHELMING`, `DEFENCES ALREADY STANDING` **and**
+   `THE ORDER FIELDS EVERY ERA AT ONCE`. In the battle itself, look at The Order's base at t=0: an MG
+   Nest, a Flak Tower, a Guard Tower and a Laser Tower standing **side by side**. Then wait for a wave
+   and confirm it is landships next to spider mechs — and check your own sidebar is still 2077 only.
+7. **TIMELINE SECURED** — fastest is `__game.chronoInvade(id)` + `__game.chronoWin()` repeatedly. The
+   map should be replaced by the green finale panel with the cumulative YOU/ORDER table and the total
+   campaign time.
+8. **The two campaigns do not touch** — take a territory in the conquest campaign, then a moment in
+   the chrono one, then reload the page and check both maps still show exactly what you left. Then
+   `RESET TIMELINE` (twice) and confirm the continent is untouched.

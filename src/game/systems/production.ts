@@ -28,6 +28,7 @@ import {
   worldToTile,
   type PlayerId,
 } from '../constants';
+import { eraAllows, eraHasBuilding, eraHasUnit } from '../eras';
 import { isBuildable, isPassable } from '../map';
 import { findNearestPassable } from '../pathfinding';
 import {
@@ -67,12 +68,33 @@ export const MAX_UNIT_QUEUE = 5;
 /** Tiles beyond the factory door the fresh unit walks to. */
 const RALLY_OFFSET = 3;
 
-/** Structures offered in the sidebar (the ConYard is pre-placed, never built). */
+/**
+ * Every structure the game knows how to build (the ConYard is pre-placed, never
+ * built). C1: this is the *type table*, not the sidebar list — the sidebar asks
+ * `buildableStructuresFor(state)`, which filters it by the battle's era.
+ */
 export const BUILDABLE_STRUCTURES: readonly BuildingTypeId[] = BUILDING_TYPE_IDS.filter(
   (id) => id !== 'conyard',
 );
-/** Units offered in the sidebar. */
+/** Every unit the game knows how to build. Era-filtered by `buildableUnitsFor`. */
 export const BUILDABLE_UNITS: readonly UnitTypeId[] = UNIT_TYPE_IDS;
+
+/**
+ * Structures the sidebar offers in this battle: `BUILDABLE_STRUCTURES` filtered
+ * by the era, in the type table's own order. In `silicon` that is exactly the
+ * ten structures that shipped before C1 (the era-exclusive ones are appended to
+ * the table after them, so the grid the player knows does not move); another era
+ * drops the types it has never heard of and its own tower / pad take their
+ * place.
+ */
+export function buildableStructuresFor(state: GameState): readonly BuildingTypeId[] {
+  return BUILDABLE_STRUCTURES.filter((id) => eraHasBuilding(state.era, id));
+}
+
+/** Units the sidebar offers in this battle: the shipped nine in `silicon`. */
+export function buildableUnitsFor(state: GameState): readonly UnitTypeId[] {
+  return BUILDABLE_UNITS.filter((id) => eraHasUnit(state.era, id));
+}
 
 export type QueueTab = 'structures' | 'units';
 
@@ -100,12 +122,29 @@ export function hasBuilding(
   return false;
 }
 
-/** Prereqs met (and, for units, a producing structure exists)? */
+/**
+ * Prereqs met (and, for units, a producing structure exists)?
+ *
+ * C1: the **era filter sits on top of the prereq system**, it does not replace
+ * it. A type that is not part of `state.era`'s roster is refused outright — for
+ * both players, and therefore for the sidebar, `enqueue`, and every AI decision
+ * that asks "could I build this" — and everything below this line is the
+ * pre-C1 test unchanged. In `silicon` the roster is the full type table, so the
+ * filter is always true and the function behaves exactly as it did.
+ *
+ * `__game.spawn` deliberately does *not* go through here (it calls `createUnit`
+ * / `createBuilding` directly), so debug spawning ignores era gating.
+ */
 export function canBuild(
   state: GameState,
   player: PlayerId,
   type: BuildingTypeId | UnitTypeId,
 ): boolean {
+  // C1: the era gate, on top of the existing prereq test. C3 lifts it for The
+  // Order alone in the ORIGIN MOMENT's temporal anomaly, which is what lets it
+  // field landships next to spider mechs; the human is never un-gated, and
+  // `state.anomaly` is false in every other battle in the game.
+  if (!eraAllows(state.era, type) && !(state.anomaly && player !== PLAYER_HUMAN)) return false;
   if (isBuildingType(type)) {
     if (type === 'conyard') return false;
     const def = BUILDING_TYPES[type];

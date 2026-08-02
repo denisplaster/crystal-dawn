@@ -740,6 +740,13 @@ export function applySplash(
 
 // --- firing -----------------------------------------------------------------
 
+/**
+ * C1: ticks a spent beam stays in `state.projectiles` purely so the renderer has
+ * a line to draw. It carries `spent: true`, so it deals no further damage and
+ * nothing can intercept it.
+ */
+export const BEAM_LIFE = 4;
+
 function spawnProjectile(
   state: GameState,
   attacker: Combatant,
@@ -753,6 +760,45 @@ function spawnProjectile(
   const muzzle = isUnitEntity(attacker) ? UNIT_TYPES[attacker.type].radius + 2 : TILE * 0.4;
   const x = ax + Math.cos(facing) * muzzle;
   const y = ay + Math.sin(facing) * muzzle;
+
+  // --- C1: beams are instant ------------------------------------------------
+  // There is nothing in flight: the damage lands on this tick, at the target's
+  // current position, and the round that goes into the array is a decoration
+  // with a lifespan. `prev` is the muzzle and `pos` the impact, which is exactly
+  // the line C2 draws.
+  if (weapon.projectile === 'beam') {
+    const bx = entityCenterX(target);
+    const by = entityCenterY(target);
+    const beam: Projectile = {
+      id: nextEntityId(state),
+      kind: 'beam',
+      player: attacker.player,
+      pos: { x: bx, y: by },
+      prev: { x, y },
+      vel: { x: 0, y: 0 },
+      target: { x: bx, y: by },
+      damage: weapon.damage,
+      warhead: weapon.warhead,
+      splash: wh.splash,
+      life: BEAM_LIFE,
+      sourceId: attacker.id,
+      weapon: weapon.id,
+      spent: true,
+    };
+    state.projectiles.push(beam);
+    resolveHit(state, beam, target);
+    addEffect(state, {
+      kind: 'muzzle',
+      x,
+      y,
+      size: weapon.damage >= 40 ? 9 : 6,
+      startTick: state.tick,
+      life: 3,
+      facing,
+      weapon: weapon.id,
+    });
+    return;
+  }
 
   const spread = weapon.inaccuracy;
   const jitterX = spread > 0 ? state.rng.range(-spread, spread) : 0;
@@ -1043,8 +1089,14 @@ function stepBuildingCombat(state: GameState, index: TargetIndex, b: Building): 
 
 // --- projectiles ------------------------------------------------------------
 
-function detonate(state: GameState, p: Projectile, direct?: Combatant): void {
-  p.dead = true;
+/**
+ * Apply a round's damage (direct hit + splash) and spawn its impact effect.
+ *
+ * Split out of `detonate` for C1's beams: an instant-hit round resolves at the
+ * moment it is fired and then *stays in the array* for a few ticks as a visual,
+ * so it must not be marked dead here.
+ */
+function resolveHit(state: GameState, p: Projectile, direct?: Combatant): void {
   const warhead = p.warhead as Weapon['warhead'];
   const weapon = p.weapon !== undefined ? WEAPONS[p.weapon] : undefined;
   if (direct && (!isAirEntity(direct) || (weapon?.targetsAir ?? false))) {
@@ -1083,12 +1135,27 @@ function detonate(state: GameState, p: Projectile, direct?: Combatant): void {
   });
 }
 
+/** Resolve a round and retire it. Everything that flies ends here. */
+function detonate(state: GameState, p: Projectile, direct?: Combatant): void {
+  p.dead = true;
+  resolveHit(state, p, direct);
+}
+
 /** Rocket steering, in radians per tick. */
 const ROCKET_TURN = 0.16;
 
 export function updateProjectiles(state: GameState): void {
   for (const p of state.projectiles) {
     if (p.dead) continue;
+
+    // C1: a spent round (a beam that has already hit) is a decoration. It keeps
+    // its muzzle -> impact line for the renderer and simply ages out; it never
+    // moves, re-aims, or damages anything a second time.
+    if (p.spent) {
+      if (p.life-- <= 0) p.dead = true;
+      continue;
+    }
+
     p.prev.x = p.pos.x;
     p.prev.y = p.pos.y;
 

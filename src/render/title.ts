@@ -15,7 +15,7 @@ import type { InputSnapshot } from '../engine/input';
 import type { AiDifficulty } from '../game/systems/ai';
 import { drawPixelText, measurePixelText } from './sprites';
 
-export type AppPhase = 'title' | 'campaign' | 'briefing' | 'playing';
+export type AppPhase = 'title' | 'campaign' | 'chrono' | 'briefing' | 'playing';
 
 // ---------------------------------------------------------------------------
 // Map selection (V2)
@@ -89,6 +89,8 @@ export type TitleAction =
   | { kind: 'map'; map: MapChoice; seed: number }
   /** V3: leave the skirmish flow for the conquest campaign map. */
   | { kind: 'campaign' }
+  /** C3: leave the skirmish flow for the chrono campaign's timeline map. */
+  | { kind: 'chrono' }
   /** Deploy. Carries the seed the mission must be built from. */
   | { kind: 'start'; map: MapChoice; seed: number };
 
@@ -114,7 +116,25 @@ export type CampaignAction =
   /** Back to the main menu. */
   | { kind: 'title' };
 
-export type PhaseAction = TitleAction | BriefingAction | CampaignAction;
+/**
+ * C3: what the chrono timeline can ask for (see `render/chrono.ts`). Declared
+ * here beside `CampaignAction` for the same reason that one is: `nextPhase` is
+ * the phase machine and it has to see every action kind that can move it. The
+ * two campaigns deliberately do **not** share an action type — `enter` and
+ * `invade` are different verbs into different modes, and keeping them apart is
+ * what makes `nextPhase` exhaustive without a mode flag.
+ */
+export type ChronoAction =
+  /** Confirmed on the insertion plate: travel to this moment and fight it. */
+  | { kind: 'enter'; moment: string }
+  /** Opened (or dismissed, with null) the insertion plate. Self-transition. */
+  | { kind: 'select'; moment: string | null }
+  /** RESET TIMELINE, past its second confirmation. Self-transition. */
+  | { kind: 'reset' }
+  /** Back to the main menu. */
+  | { kind: 'title' };
+
+export type PhaseAction = TitleAction | BriefingAction | CampaignAction | ChronoAction;
 
 /**
  * The whole phase machine. Pure, so it can be exercised headlessly.
@@ -122,22 +142,29 @@ export type PhaseAction = TitleAction | BriefingAction | CampaignAction;
  * ```
  * title --start----> briefing --start--> playing      (skirmish)
  * title --campaign-> campaign --invade-> briefing --start--> playing
+ * title --chrono---> chrono   --enter--> briefing --start--> playing
  * ```
  *
- * Every other action (picking a difficulty, skipping the typewriter, opening
- * the invade plate, wiping the save) leaves the phase where it is, and
- * 'playing' is terminal — leaving a mission is `restart()` or a jump back to
- * the campaign map from the debriefing, not a phase *action*.
+ * Every other action (picking a difficulty, skipping the typewriter, opening a
+ * plate, wiping a save) leaves the phase where it is, and 'playing' is terminal
+ * — leaving a mission is `restart()` or a jump back to one of the two campaign
+ * maps from the debriefing, not a phase *action*. The two campaign phases are
+ * siblings and neither can reach the other: the only way across is the title.
  */
 export function nextPhase(phase: AppPhase, action: PhaseAction | null): AppPhase {
   if (action === null) return phase;
   if (phase === 'title') {
     if (action.kind === 'campaign') return 'campaign';
+    if (action.kind === 'chrono') return 'chrono';
     return action.kind === 'start' ? 'briefing' : 'title';
   }
   if (phase === 'campaign') {
     if (action.kind === 'invade') return 'briefing';
     return action.kind === 'title' ? 'title' : 'campaign';
+  }
+  if (phase === 'chrono') {
+    if (action.kind === 'enter') return 'briefing';
+    return action.kind === 'title' ? 'title' : 'chrono';
   }
   if (phase === 'briefing') return action.kind === 'start' ? 'playing' : 'briefing';
   return phase;
@@ -145,9 +172,9 @@ export function nextPhase(phase: AppPhase, action: PhaseAction | null): AppPhase
 
 export const DIFFICULTIES: readonly AiDifficulty[] = ['easy', 'normal', 'hard'];
 
-export type TitleTarget = AiDifficulty | MapChoice | 'start' | 'campaign';
+export type TitleTarget = AiDifficulty | MapChoice | 'start' | 'campaign' | 'chrono';
 
-export type TitleRow = 'difficulty' | 'map' | 'start' | 'campaign';
+export type TitleRow = 'difficulty' | 'map' | 'start' | 'campaign' | 'chrono';
 
 interface Button {
   id: TitleTarget;
@@ -170,6 +197,9 @@ const COL = {
   panel: 'rgba(12, 15, 9, 0.82)',
   edge: '#3c4630',
   on: '#8dff6a',
+  /** C3: the chrono plate reads teal, so the two campaigns are never confused. */
+  chrono: '#4fd6e8',
+  chronoEdge: '#c9f6ff',
 } as const;
 
 /** Vertical geometry of the menu block, shared by layout and drawing. */
@@ -187,8 +217,21 @@ const START_H = 42;
  * is an alternative offered underneath it rather than a mode switch the player
  * has to make first.
  */
-const CAMPAIGN_GAP = 30;
-const CAMPAIGN_H = 30;
+const CAMPAIGN_GAP = 22;
+const CAMPAIGN_H = 28;
+/**
+ * C3: the chrono campaign is a *second* plate stacked directly under the
+ * conquest one, close enough that the two read as one "campaigns" block rather
+ * than as two unrelated offers. The skirmish block above them is unchanged in
+ * order, geometry and behaviour; only `menuTop`'s reserved height moved.
+ */
+const CHRONO_GAP = 6;
+const CHRONO_H = 28;
+/**
+ * Slack kept below the last plate so the footer hint (drawn at h - 18) can
+ * never be crowded on a short window. 640x480 is the binding case.
+ */
+const MENU_FOOT = 40;
 
 export class TitleScreen {
   difficulty: AiDifficulty = 'normal';
@@ -217,7 +260,16 @@ export class TitleScreen {
     // the campaign row under it and the label above it; keep all of it on
     // screen on short windows.
     const block =
-      DIFF_H + ROW_GAP + MAP_BTN_H + START_GAP + START_H + CAMPAIGN_GAP + CAMPAIGN_H + 18;
+      DIFF_H +
+      ROW_GAP +
+      MAP_BTN_H +
+      START_GAP +
+      START_H +
+      CAMPAIGN_GAP +
+      CAMPAIGN_H +
+      CHRONO_GAP +
+      CHRONO_H +
+      MENU_FOOT;
     // Never let the SELECT DIFFICULTY caption climb into the subtitle: the menu
     // starts below the logo block (drawLogo: top h*0.16, subtitle at +scale*18,
     // glyphs 8 rows tall at scale/4). On very short windows the on-screen clamp
@@ -276,14 +328,24 @@ export class TitleScreen {
       w: sw,
       h: START_H,
     });
+    const campaignY = startY + START_H + CAMPAIGN_GAP;
     out.push({
       id: 'campaign',
       row: 'campaign',
       label: '[C] CONQUEST CAMPAIGN',
       x: Math.round((w - sw) / 2),
-      y: startY + START_H + CAMPAIGN_GAP,
+      y: campaignY,
       w: sw,
       h: CAMPAIGN_H,
+    });
+    out.push({
+      id: 'chrono',
+      row: 'chrono',
+      label: '[X] CHRONO CAMPAIGN',
+      x: Math.round((w - sw) / 2),
+      y: campaignY + CAMPAIGN_H + CHRONO_GAP,
+      w: sw,
+      h: CHRONO_H,
     });
     return out;
   }
@@ -320,6 +382,7 @@ export class TitleScreen {
   handleClick(w: number, h: number, x: number, y: number): TitleAction {
     const hit = this.hitTest(w, h, x, y);
     if (hit === 'campaign') return { kind: 'campaign' };
+    if (hit === 'chrono') return { kind: 'chrono' };
     if (hit !== null && hit !== 'start') {
       if (isMapChoice(hit)) return this.selectMap(hit);
       this.difficulty = hit as AiDifficulty;
@@ -347,6 +410,9 @@ export class TitleScreen {
     // V3: C opens the conquest campaign. Checked before Enter/Space so the
     // deploy keys keep meaning "deploy the skirmish", unchanged.
     if (snap.pressed.has('KeyC')) return { kind: 'campaign' };
+    // C3: X opens the chrono campaign. Same placement rule as C — before the
+    // deploy keys, so Enter/Space still mean "deploy the skirmish", unchanged.
+    if (snap.pressed.has('KeyX')) return { kind: 'chrono' };
     if (snap.pressed.has('Enter') || snap.pressed.has('Space')) return this.deploy();
 
     for (const click of snap.clicks) {
@@ -375,7 +441,7 @@ export class TitleScreen {
     ctx.textAlign = 'center';
     ctx.textBaseline = 'alphabetic';
     ctx.fillText(
-      '1/2/3 DIFFICULTY   CLICK SECTOR   ENTER DEPLOY   C CAMPAIGN   M MUTE',
+      '1/2/3 DIFFICULTY   CLICK SECTOR   ENTER DEPLOY   C CONQUEST   X CHRONO   M MUTE',
       Math.round(w / 2),
       h - 18,
     );
@@ -463,6 +529,7 @@ export class TitleScreen {
     for (const b of buttons) {
       const isStart = b.row === 'start';
       const isCampaign = b.row === 'campaign';
+      const isChrono = b.row === 'chrono';
       const active =
         (b.row === 'difficulty' && b.id === this.difficulty) ||
         (b.row === 'map' && b.id === this.map);
@@ -471,14 +538,22 @@ export class TitleScreen {
 
       ctx.fillStyle = active || (isStart && blink) ? 'rgba(60, 74, 38, 0.9)' : COL.panel;
       ctx.fillRect(b.x, b.y, b.w, b.h);
-      ctx.strokeStyle = active ? COL.on : hot ? COL.bright : isCampaign ? COL.logo : COL.edge;
+      ctx.strokeStyle = active
+        ? COL.on
+        : hot
+          ? COL.bright
+          : isCampaign
+            ? COL.logo
+            : isChrono
+              ? COL.chrono
+              : COL.edge;
       ctx.lineWidth = active || hot ? 2 : 1;
       ctx.strokeRect(b.x + 0.5, b.y + 0.5, b.w - 1, b.h - 1);
 
       // The map and campaign rows carry longer labels in narrower plates, so
       // they drop to a smaller face rather than overflowing.
       const scale =
-        b.row === 'map' || isCampaign
+        b.row === 'map' || isCampaign || isChrono
           ? measurePixelText(b.label, 2) + 8 <= b.w
             ? 2
             : 1
@@ -490,13 +565,17 @@ export class TitleScreen {
           ? hot
             ? COL.logoEdge
             : COL.logo
-          : isStart
-            ? blink
-              ? COL.bright
-              : COL.text
-            : hot
-              ? COL.bright
-              : COL.text;
+          : isChrono
+            ? hot
+              ? COL.chronoEdge
+              : COL.chrono
+            : isStart
+              ? blink
+                ? COL.bright
+                : COL.text
+              : hot
+                ? COL.bright
+                : COL.text;
       drawPixelText(
         ctx,
         b.label,

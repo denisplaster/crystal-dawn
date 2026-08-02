@@ -16,6 +16,7 @@
  */
 
 import type { InputSnapshot } from '../engine/input';
+import { ERAS, type EraId } from '../game/eras';
 import { drawPixelText, measurePixelText } from './sprites';
 import { DEFAULT_MAP, mapDef, sectorCode, type BriefingAction } from './title';
 
@@ -68,8 +69,75 @@ export const BRIEFING_LINES: readonly BriefingLine[] = [
   L('bullet', 'PRESS [H] IN THE FIELD FOR CONTROLS'),
 ];
 
-/** Total typewriter characters. Rules and blank lines cost nothing. */
-export const BRIEFING_CHARS = BRIEFING_LINES.reduce((n, l) => n + l.text.length, 0);
+/** Total typewriter characters of a copy set. Rules and blanks cost nothing. */
+export function briefingCharsOf(lines: readonly BriefingLine[]): number {
+  return lines.reduce((n, l) => n + l.text.length, 0);
+}
+
+/** Total typewriter characters of the skirmish / conquest briefing. */
+export const BRIEFING_CHARS = briefingCharsOf(BRIEFING_LINES);
+
+/**
+ * C3 — what a chrono briefing is about. `main.ts` hands one over when the next
+ * mission is a chrono moment and `null` for everything else, which is what
+ * keeps a skirmish and a conquest battle on the copy above, verbatim.
+ */
+export interface MomentBriefing {
+  /** The era whose `flavor` supplies the situation and the directives (C1). */
+  era: EraId;
+  /** Moment name, e.g. `THE AIRFIELD`. */
+  moment: string;
+  /** Year as printed, e.g. `1943` or `YEAR ZERO`. */
+  year: string;
+  /** The ORIGIN MOMENT: adds the mixed-roster warning. */
+  anomaly?: boolean;
+}
+
+/** `TEMPORAL INSERTION: THE AIRFIELD, 1943`. */
+export function insertionHeadline(b: MomentBriefing): string {
+  return `TEMPORAL INSERTION: ${b.moment}, ${b.year}`;
+}
+
+/**
+ * The copy for one briefing.
+ *
+ * `null` returns `BRIEFING_LINES` **by identity** — the skirmish and the
+ * conquest campaign get the same array object, so nothing about them can have
+ * moved. A chrono moment gets the era's own situation and field directives,
+ * which C1 already wrote onto `EraDef.flavor` for exactly this, under a header
+ * naming the moment and the year.
+ */
+export function briefingLines(b: MomentBriefing | null): readonly BriefingLine[] {
+  if (!b) return BRIEFING_LINES;
+  const era = ERAS[b.era];
+  const lines: BriefingLine[] = [
+    L('head', insertionHeadline(b)),
+    L('sub', `CHRONO GATE - ${era.label}`),
+    L('rule'),
+    L('label', 'SITUATION'),
+  ];
+  for (const line of era.flavor.situation) lines.push(L('body', line));
+  if (b.anomaly === true) {
+    lines.push(L('gap'));
+    lines.push(L('label', 'ANOMALY'));
+    lines.push(L('body', 'THE GATE HAS TORN HERE AND EVERY WAR IS HAPPENING AT ONCE.'));
+    lines.push(L('body', 'THE ORDER IS FIELDING HARDWARE FROM ALL FOUR ERAS.'));
+  }
+  lines.push(L('gap'));
+  lines.push(L('label', 'OBJECTIVE'));
+  lines.push(L('body', 'DESTROY ALL ORDER STRUCTURES IN THIS MOMENT.'));
+  lines.push(L('gap'));
+  lines.push(L('label', 'DEFEAT'));
+  lines.push(L('body', 'YOU ARE DEFEATED IF YOU LOSE ALL PRODUCTION'));
+  lines.push(L('body', 'STRUCTURES AND CANNOT REBUILD.'));
+  lines.push(L('gap'));
+  lines.push(L('label', 'FIELD DIRECTIVES'));
+  lines.push(L('bullet', `${era.flavor.tag} - THIS IS ${era.short} DOCTRINE`));
+  for (const line of era.flavor.directives) lines.push(L('bullet', line));
+  lines.push(L('bullet', 'HARVESTERS AND ENGINEERS TRAVEL WITH YOU IN EVERY ERA'));
+  lines.push(L('bullet', 'PRESS [H] IN THE FIELD FOR CONTROLS'));
+  return lines;
+}
 
 /** Characters revealed per rendered frame (~180/s at 60 fps). */
 export const CHARS_PER_FRAME = 3;
@@ -120,14 +188,38 @@ export class BriefingScreen {
    */
   mission = missionTag(mapDef(DEFAULT_MAP).label, mapDef(DEFAULT_MAP).seed);
 
+  /**
+   * C3: the chrono moment this briefing is for, or null for a skirmish / a
+   * conquest battle (which is every caller that never sets it). Setting it
+   * swaps the whole copy set; `total` follows, so the typewriter is always
+   * measured against what is actually on the panel.
+   */
+  private momentBriefing: MomentBriefing | null = null;
+
   /** Header tag for a mission: `MAP ALPHA - SECTOR 0163`. */
   setMission(label: string, seed: number, kind = 'MAP'): void {
     this.mission = missionTag(label, seed, kind);
   }
 
+  /** C3: swap in a chrono moment's copy, or `null` for the standard briefing. */
+  setMoment(b: MomentBriefing | null): void {
+    this.momentBriefing = b;
+    this.revealed = Math.min(this.revealed, this.total);
+  }
+
+  /** The copy this briefing is currently typing out. */
+  get lines(): readonly BriefingLine[] {
+    return briefingLines(this.momentBriefing);
+  }
+
+  /** Typewriter characters in the active copy. */
+  get total(): number {
+    return briefingCharsOf(this.lines);
+  }
+
   /** Has the whole briefing been typed out? */
   get complete(): boolean {
-    return this.revealed >= BRIEFING_CHARS;
+    return this.revealed >= this.total;
   }
 
   /** Back to an empty screen (entering the briefing, or a phase jump). */
@@ -138,13 +230,13 @@ export class BriefingScreen {
 
   /** Type `chars` more characters. Returns the new revealed count. */
   advance(chars: number = CHARS_PER_FRAME): number {
-    this.revealed = Math.min(BRIEFING_CHARS, Math.max(0, this.revealed + chars));
+    this.revealed = Math.min(this.total, Math.max(0, this.revealed + chars));
     return this.revealed;
   }
 
   /** Dump the rest of the text immediately. */
   skip(): void {
-    this.revealed = BRIEFING_CHARS;
+    this.revealed = this.total;
   }
 
   // --- tick ---------------------------------------------------------------
@@ -172,7 +264,7 @@ export class BriefingScreen {
   /** Font scale that fits the widest line, with room for the panel padding. */
   scale(w: number): number {
     let widest = 0;
-    for (const line of BRIEFING_LINES) {
+    for (const line of this.lines) {
       widest = Math.max(widest, measurePixelText(line.text, 1));
     }
     widest = Math.max(widest, measurePixelText(BRIEFING_PROMPT, 1));
@@ -190,13 +282,14 @@ export class BriefingScreen {
 
     this.drawBackdrop(ctx, terrain, w, h);
 
+    const lines = this.lines;
     const scale = this.scale(w);
     const padX = 10 * scale;
     const padY = 8 * scale;
 
     let contentW = 0;
     let contentH = 0;
-    for (const line of BRIEFING_LINES) {
+    for (const line of lines) {
       contentW = Math.max(contentW, measurePixelText(line.text, scale));
       contentH += lineHeight(line.kind, scale);
     }
@@ -237,7 +330,7 @@ export class BriefingScreen {
     let y = py + padY;
     const x0 = px + padX;
 
-    for (const line of BRIEFING_LINES) {
+    for (const line of lines) {
       const adv = lineHeight(line.kind, scale);
       if (line.kind === 'rule') {
         ctx.fillStyle = COL.edge;

@@ -19,6 +19,7 @@ import {
   TILE,
   WORLD_H,
   WORLD_W,
+  clamp,
   tileIndex,
 } from '../game/constants';
 import { BUILDING_TYPES, UNIT_TYPES } from '../game/rules';
@@ -31,20 +32,34 @@ import {
   type Unit,
   type UnitStance,
 } from '../game/state';
+import { BEAM_LIFE } from '../game/systems/combat';
 import { isEntityVisibleToHuman, isTileVisible } from '../game/systems/fog';
 import {
   EXPLOSION_FRAMES,
+  FLAK_FRAMES,
+  FLARE_FRAMES,
+  PROP_FRAMES,
   ROTOR_FRAMES,
+  SHOCKWAVE_FRAMES,
+  airChromeFor,
+  beamInk,
   drawPixelText,
   facingIndex,
+  getBeamFlare,
+  getBombSprite,
   getBuildingSprite,
   getExplosionSprite,
+  getFlakPuff,
   getMuzzleFlash,
+  getPlasmaBolt,
+  getPropSprite,
   getRotorSprite,
   getTerrainSprite,
   getTowerTurret,
+  getShockwave,
   getUnitSprite,
   getUnitTurret,
+  type BeamStyle,
 } from './sprites';
 
 export interface HudInfo {
@@ -70,6 +85,37 @@ const HEALTH_BAR_H = 3;
  */
 const AIR_SHADOW_OFFSET = 6;
 const AIR_SHADOW_DOCKED = 2;
+
+/**
+ * C2: a render-side impact effect, spawned when a round the sim does not tag on
+ * detonation disappears from `state.projectiles`.
+ *
+ * Why this exists: `Effect` carries no weapon id on an explosion, so the flak
+ * airburst and the dive bomber's heavier blast cannot be told apart from any
+ * other splash by the effect alone — and adding a field to `Effect` would be a
+ * sim change. Instead the renderer watches the two weapons that want their own
+ * look, remembers each round's committed impact point (`Projectile.target`), and
+ * emits its own effect when the round leaves the array. It is purely additive:
+ * the sim's own explosion still plays underneath, so a missed round degrades to
+ * exactly the pre-C2 picture.
+ */
+interface ImpactFx {
+  kind: 'flak' | 'bomb';
+  x: number;
+  y: number;
+  startTick: number;
+  life: number;
+}
+
+/** Weapons the impact tracker watches. Anything else is left to `Effect`. */
+const TRACKED_IMPACTS: Record<string, ImpactFx['kind']> = {
+  flakBurst: 'flak',
+  bombRun: 'bomb',
+};
+
+const IMPACT_LIFE: Record<ImpactFx['kind'], number> = { flak: 10, bomb: 14 };
+/** Hard cap, mirroring the sim's own 192-effect cap. */
+const MAX_IMPACT_FX = 96;
 
 const SIDEBAR_BG = '#14170f';
 const SIDEBAR_EDGE = '#2e3423';
@@ -98,6 +144,12 @@ export class Renderer {
 
   /** F toggles the tile grid + passability overlay. */
   debugOverlay = false;
+
+  /** C2: render-side impact effects + the projectile bookkeeping that feeds them. */
+  private readonly impactFx: ImpactFx[] = [];
+  private readonly trackedRounds = new Map<number, { x: number; y: number; kind: ImpactFx['kind'] }>();
+  /** The tick the tracker last diffed, so it runs once per tick, not per frame. */
+  private trackedTick = -1;
 
   /**
    * Phase 3: `render/ui.ts` owns the sidebar strip. When this hook is set the
@@ -225,11 +277,13 @@ export class Renderer {
 
     const camX = Math.round(cam.x);
     const camY = Math.round(cam.y);
+    this.trackImpacts(state);
     this.drawTerrain(camX, camY);
     this.drawBuildings(state, camX, camY);
     this.drawUnits(state, alpha, camX, camY);
     this.drawProjectiles(state, alpha, camX, camY);
     this.drawEffects(state, alpha, camX, camY);
+    this.drawImpactFx(state, alpha, camX, camY);
     this.drawFog(state, camX, camY);
     this.drawPlacementGhost(state, camX, camY);
     if (this.debugOverlay) this.drawDebugOverlay(state, camX, camY);
@@ -266,6 +320,18 @@ export class Renderer {
    */
   invalidateFog(): void {
     this.fogVersion = -1;
+  }
+
+  /**
+   * C2: drop the render-side impact effects and the rounds being watched for
+   * them. Called from `restart()` alongside `buildTerrain` / `invalidateFog`,
+   * because both are keyed on `state.tick` and on entity ids, and a new mission
+   * restarts both numberings.
+   */
+  resetFx(): void {
+    this.impactFx.length = 0;
+    this.trackedRounds.clear();
+    this.trackedTick = -1;
   }
 
   /**
@@ -313,6 +379,12 @@ export class Renderer {
         const frac = p.storage > 0 ? p.credits / p.storage : 0;
         return Math.max(0, Math.min(3, Math.floor(frac * 4)));
       }
+      // C2: the Laser Tower's frames are a power state, not an animation. A
+      // tower whose owner is in deficit goes dark — which is the visible half of
+      // the Phase 4 rule that `weaponOf` returns null for a defence under
+      // `lowPower`, and until now nothing on screen said so.
+      case 'lasertower':
+        return state.players[b.player].lowPower ? 0 : 1;
       default:
         return 0;
     }
@@ -365,8 +437,10 @@ export class Renderer {
         ctx.drawImage(getBuildingSprite(b.type, b.player, 'ready', frame), sx, sy);
         ctx.globalAlpha = 1;
       } else if (def.turret) {
-        // Defensive structures composite their gun at `turretFacing`.
-        const turret = getTowerTurret(b.player, facingIndex(b.turretFacing ?? 0));
+        // Defensive structures composite their gun at `turretFacing`. C2 gives
+        // each era's emplacement its own weapon (C1 shipped them all wearing the
+        // 1991 autocannon); the type is the only new argument.
+        const turret = getTowerTurret(b.player, facingIndex(b.turretFacing ?? 0), b.type);
         ctx.drawImage(
           turret,
           Math.round(sx + wpx / 2 - turret.width / 2),
@@ -448,14 +522,30 @@ export class Renderer {
     }
 
     if (def.isAir) {
-      // Rotor over the airframe. It spins with the sim clock while airborne and
-      // idles on a single frame while docked, which (with the tight shadow) is
-      // the read for "parked on the pad".
-      const frame = u.docked ? 0 : Math.floor(state.tick) % ROTOR_FRAMES;
-      const rotor = getRotorSprite(u.player, frame);
-      ctx.globalAlpha = u.docked ? 0.55 : 0.8;
-      ctx.drawImage(rotor, Math.round(sx - rotor.width / 2), Math.round(sy - rotor.height / 2));
-      ctx.globalAlpha = 1;
+      // What spins over the airframe is era art, not a property of flight: V2
+      // keyed the helicopter rotor on `isAir`, which put a rotor disc over a
+      // 1943 prop bomber and over a 2077 drone with no moving parts at all.
+      // It still spins with the sim clock while airborne and idles on a single
+      // frame while docked, which (with the tight shadow) reads as "on the pad".
+      const chrome = airChromeFor(u.type);
+      if (chrome === 'rotor') {
+        const frame = u.docked ? 0 : Math.floor(state.tick) % ROTOR_FRAMES;
+        const rotor = getRotorSprite(u.player, frame);
+        ctx.globalAlpha = u.docked ? 0.55 : 0.8;
+        ctx.drawImage(rotor, Math.round(sx - rotor.width / 2), Math.round(sy - rotor.height / 2));
+        ctx.globalAlpha = 1;
+      } else if (chrome === 'prop') {
+        // A propeller lives at the nose, so the disc is offset along the hull's
+        // facing rather than centred on it.
+        const frame = u.docked ? 0 : Math.floor(state.tick) % PROP_FRAMES;
+        const prop = getPropSprite(u.player, frame);
+        const nose = def.radius * 0.78;
+        const px = sx + Math.cos(u.facing) * nose;
+        const py = sy + Math.sin(u.facing) * nose;
+        ctx.globalAlpha = u.docked ? 0.5 : 0.85;
+        ctx.drawImage(prop, Math.round(px - prop.width / 2), Math.round(py - prop.height / 2));
+        ctx.globalAlpha = 1;
+      }
     }
 
     const size = def.radius * 2 + 4;
@@ -579,15 +669,85 @@ export class Renderer {
       }
       if (!isTileVisible(state, Math.floor(wx / TILE), Math.floor(wy / TILE))) continue;
 
+      // C2: energy rounds are their own thing — a glowing bolt with a soft
+      // trail rather than a tracer streak. Keyed on the *warhead*, so plasma
+      // bolts, pulse-cannon shells and drone bolts all read as one weapon
+      // family without the renderer knowing a single unit type name.
+      if (p.warhead === 'plasma' || p.warhead === 'railSlug') {
+        const rail = p.warhead === 'railSlug';
+        const size = p.damage >= 30 ? 4 : p.damage >= 18 ? 3 : 2;
+        const bolt = getPlasmaBolt(size, rail ? 'rail' : 'plasma');
+        ctx.strokeStyle = rail ? 'rgba(200, 190, 255, 0.45)' : 'rgba(90, 240, 200, 0.40)';
+        ctx.lineWidth = rail ? 2 : 1;
+        ctx.beginPath();
+        ctx.moveTo(p.prev.x - camX, p.prev.y - camY);
+        ctx.lineTo(sx, sy);
+        ctx.stroke();
+        ctx.drawImage(bolt, Math.round(sx - bolt.width / 2), Math.round(sy - bolt.height / 2));
+        continue;
+      }
+
       if (p.kind === 'bullet') {
-        ctx.strokeStyle = 'rgba(255, 238, 170, 0.9)';
+        // 1943 flak is a dark shell with a burning tracer element, not a
+        // machine-gun streak; the airburst itself comes from `impactFx`.
+        const flak = p.weapon === 'flakBurst';
+        ctx.strokeStyle = flak ? 'rgba(255, 190, 120, 0.75)' : 'rgba(255, 238, 170, 0.9)';
         ctx.lineWidth = 1;
         ctx.beginPath();
         ctx.moveTo(p.prev.x - camX, p.prev.y - camY);
         ctx.lineTo(sx, sy);
         ctx.stroke();
-        ctx.fillStyle = '#fff6d0';
-        ctx.fillRect(Math.round(sx) - 1, Math.round(sy) - 1, 2, 2);
+        if (flak) {
+          ctx.fillStyle = '#2b2c22';
+          ctx.fillRect(Math.round(sx) - 2, Math.round(sy) - 1, 3, 2);
+          ctx.fillStyle = '#ffd75e';
+          ctx.fillRect(Math.round(sx) + 1, Math.round(sy) - 1, 1, 2);
+        } else {
+          ctx.fillStyle = '#fff6d0';
+          ctx.fillRect(Math.round(sx) - 1, Math.round(sy) - 1, 2, 2);
+        }
+        continue;
+      }
+
+      // A beam is a line from the muzzle (`prev`) to the impact (`pos`), already
+      // resolved by the sim on the tick it was fired; `life` is the four ticks
+      // it lingers for. C2 draws it as a real laser: a wide soft bloom, a
+      // saturated mid stroke and a white-hot core, plus a collapsing flare at
+      // the impact and a spark back at the muzzle. Colour follows the weapon —
+      // the 2077 tower cuts teal, the phase lance is violet and much heavier.
+      if (p.kind === 'beam') {
+        const life = Math.max(1, BEAM_LIFE);
+        const fade = clamp((p.life ?? 0) / life, 0, 1);
+        const style: BeamStyle = p.weapon === 'beamLance' ? 'lance' : 'laser';
+        const ink = beamInk(style);
+        const heavy = style === 'lance';
+        const x0 = p.prev.x - camX;
+        const y0 = p.prev.y - camY;
+        const x1 = p.pos.x - camX;
+        const y1 = p.pos.y - camY;
+        const stroke = (color: string, width: number): void => {
+          ctx.strokeStyle = color;
+          ctx.lineWidth = width;
+          ctx.beginPath();
+          ctx.moveTo(x0, y0);
+          ctx.lineTo(x1, y1);
+          ctx.stroke();
+        };
+        ctx.globalAlpha = 0.35 + 0.65 * fade;
+        stroke(ink.glow, heavy ? 10 : 7);
+        stroke(ink.glow, heavy ? 6 : 4);
+        stroke(ink.mid, heavy ? 4 : 2.5);
+        stroke(ink.core, heavy ? 2 : 1);
+        ctx.globalAlpha = 1;
+
+        const frame = Math.min(FLARE_FRAMES - 1, Math.floor((1 - fade) * FLARE_FRAMES));
+        const flare = getBeamFlare(style, frame);
+        ctx.globalAlpha = fade;
+        ctx.drawImage(flare, Math.round(x1 - flare.width / 2), Math.round(y1 - flare.height / 2));
+        const spark = getBeamFlare(style, Math.min(FLARE_FRAMES - 1, frame + 1));
+        ctx.globalAlpha = fade * 0.7;
+        ctx.drawImage(spark, Math.round(x0 - spark.width / 2), Math.round(y0 - spark.height / 2));
+        ctx.globalAlpha = 1;
         continue;
       }
 
@@ -614,10 +774,102 @@ export class Renderer {
         ctx.ellipse(sx, sy, 4, 2, 0, 0, Math.PI * 2);
         ctx.fill();
       }
+      // C2: a dive bomber's stick is a bomb, not a howitzer shell — it tumbles
+      // nose-over-tail all the way down and lands with a shockwave.
+      if (p.weapon === 'bombRun') {
+        const bomb = getBombSprite(Math.floor(state.tick / 2 + p.id));
+        ctx.drawImage(
+          bomb,
+          Math.round(sx - bomb.width / 2),
+          Math.round(sy - lift - bomb.height / 2),
+        );
+        continue;
+      }
       ctx.fillStyle = '#2b2c22';
       ctx.fillRect(Math.round(sx) - 2, Math.round(sy - lift) - 2, 4, 4);
       ctx.fillStyle = '#b9bda2';
       ctx.fillRect(Math.round(sx) - 1, Math.round(sy - lift) - 2, 2, 2);
+    }
+  }
+
+  /**
+   * Diff `state.projectiles` once per tick and emit a render-side effect for a
+   * watched round that has left the array (i.e. detonated or fizzled). The
+   * impact point is the round's own committed `target`, not its last drawn
+   * position, so the burst lands where the shot landed rather than a tick short.
+   */
+  private trackImpacts(state: GameState): void {
+    if (state.tick === this.trackedTick) return;
+    this.trackedTick = state.tick;
+
+    const live = new Set<number>();
+    for (const p of state.projectiles as Projectile[]) {
+      if (p.dead) continue;
+      const kind = p.weapon ? TRACKED_IMPACTS[p.weapon] : undefined;
+      if (!kind) continue;
+      live.add(p.id);
+      const rec = this.trackedRounds.get(p.id);
+      if (rec) {
+        rec.x = p.target.x;
+        rec.y = p.target.y;
+      } else {
+        this.trackedRounds.set(p.id, { x: p.target.x, y: p.target.y, kind });
+      }
+    }
+
+    for (const [id, rec] of this.trackedRounds) {
+      if (live.has(id)) continue;
+      this.trackedRounds.delete(id);
+      if (this.impactFx.length >= MAX_IMPACT_FX) continue;
+      this.impactFx.push({
+        kind: rec.kind,
+        x: rec.x,
+        y: rec.y,
+        startTick: state.tick,
+        life: IMPACT_LIFE[rec.kind],
+      });
+    }
+
+    // Age the list here rather than in draw, so it stays bounded even when the
+    // page is not painting (a backgrounded tab still ticks).
+    for (let i = this.impactFx.length - 1; i >= 0; i--) {
+      const fx = this.impactFx[i] as ImpactFx;
+      if (state.tick - fx.startTick > fx.life) this.impactFx.splice(i, 1);
+    }
+  }
+
+  /**
+   * The C2 impact layer: flak airbursts and bomb shockwaves, drawn *over* the
+   * sim's own explosion effects so the two composite into one heavier blast.
+   * Fog-gated exactly like `drawEffects` — you do not see what you cannot see.
+   */
+  private drawImpactFx(state: GameState, alpha: number, camX: number, camY: number): void {
+    if (this.impactFx.length === 0) return;
+    const ctx = this.ctx;
+    const now = state.tick + alpha;
+    for (const fx of this.impactFx) {
+      const age = now - fx.startTick;
+      if (age < 0 || age > fx.life) continue;
+      const sx = fx.x - camX;
+      const sy = fx.y - camY;
+      if (sx < -64 || sy < -64 || sx > this.camera.viewW + 64 || sy > this.camera.viewH + 64) {
+        continue;
+      }
+      if (!isTileVisible(state, Math.floor(fx.x / TILE), Math.floor(fx.y / TILE))) continue;
+
+      const t = Math.max(0, Math.min(0.999, age / fx.life));
+      if (fx.kind === 'flak') {
+        const sprite = getFlakPuff(Math.floor(t * FLAK_FRAMES));
+        ctx.drawImage(
+          sprite,
+          Math.round(sx - sprite.width / 2),
+          Math.round(sy - sprite.height / 2),
+        );
+        continue;
+      }
+      // A 50px-splash bomb: the ordinary explosion plus an expanding ring.
+      const sprite = getShockwave(Math.floor(t * SHOCKWAVE_FRAMES), 40);
+      ctx.drawImage(sprite, Math.round(sx - sprite.width / 2), Math.round(sy - sprite.height / 2));
     }
   }
 

@@ -25,6 +25,20 @@ import {
   type CampaignReport,
   type CampaignState,
 } from './game/campaign';
+import {
+  beginMoment,
+  chronoBattleConfig,
+  chronoReport,
+  defaultChronoStorage,
+  isMomentId,
+  loadChrono,
+  resetChrono,
+  resolveMoment,
+  saveChrono,
+  type ChronoBattleConfig,
+  type ChronoReport,
+  type ChronoState,
+} from './game/chrono';
 import { MAP_H, MAP_W, PLAYER_HUMAN, type PlayerId } from './game/constants';
 import {
   isBuildingType,
@@ -32,6 +46,7 @@ import {
   type BuildingTypeId,
   type UnitTypeId,
 } from './game/rules';
+import { DEFAULT_ERA, ERAS, isEraId, type EraDef, type EraId } from './game/eras';
 import { humanStartTile, initSkirmish } from './game/skirmish';
 import {
   createBuilding,
@@ -80,9 +95,15 @@ import {
 import { updateVictory } from './game/systems/victory';
 import { Sfx, SFX_NAMES, type SfxName } from './audio/sfx';
 import { Renderer } from './render/renderer';
-import { auditSprites, initSprites, type SpriteAuditEntry } from './render/sprites';
-import { BRIEFING_CHARS, BriefingScreen } from './render/briefing';
+import {
+  auditSprites,
+  initSprites,
+  setTerrainPalette,
+  type SpriteAuditEntry,
+} from './render/sprites';
+import { BriefingScreen } from './render/briefing';
 import { CampaignScreen } from './render/campaign';
+import { ChronoScreen } from './render/chrono';
 import { DebriefScreen, missionTime, type DebriefInfo } from './render/debrief';
 import { Hud } from './render/hud';
 import {
@@ -157,17 +178,32 @@ let campaignBattle: CampaignBattleConfig | null = null;
 let campaignResolved = false;
 
 /**
- * Title -> (campaign) -> briefing -> mission. The sim does not tick while the
- * phase is anything other than 'playing': all three pre-mission screens animate
- * off their own render-side frame counters.
+ * C3 — chrono campaign. The exact same shape as the conquest campaign one
+ * scroll up, and deliberately a *parallel* set of variables rather than a
+ * shared "campaign" abstraction: the two modes hold separate saves, separate
+ * state objects and separate battle configs, and the mutual exclusion below
+ * ("a battle knows which mode owns it") is what keeps a conquest battle from
+ * ever writing the timeline or vice versa.
+ */
+const chronoStorage = defaultChronoStorage();
+let chrono: ChronoState = loadChrono(chronoStorage);
+let chronoBattle: ChronoBattleConfig | null = null;
+let chronoResolved = false;
+
+/**
+ * Title -> (campaign | chrono) -> briefing -> mission. The sim does not tick
+ * while the phase is anything other than 'playing': all four pre-mission
+ * screens animate off their own render-side frame counters.
  */
 const title = new TitleScreen();
 const briefing = new BriefingScreen();
 const campaignScreen = new CampaignScreen((id) => campaignBattleConfig(campaign, id));
+const chronoScreen = new ChronoScreen((id) => chronoBattleConfig(chrono, id));
 let phase: AppPhase = 'title';
 renderer.titleDraw = (ctx, terrain, w, h) => {
   if (phase === 'briefing') briefing.draw(ctx, terrain, w, h);
   else if (phase === 'campaign') campaignScreen.draw(ctx, terrain, w, h, campaign);
+  else if (phase === 'chrono') chronoScreen.draw(ctx, terrain, w, h, chrono);
   else title.draw(ctx, terrain, w, h);
 };
 
@@ -193,6 +229,15 @@ renderer.resultDraw = (ctx, gs, w, h) => debrief.draw(ctx, gs, missionInfo(), w,
  * two foot prompts (see `render/debrief.ts`); a skirmish is untouched.
  */
 function missionInfo(): DebriefInfo {
+  if (chronoBattle) {
+    return {
+      mapLabel: chronoBattle.name,
+      seed: chronoBattle.seed,
+      difficulty,
+      kind: 'MOMENT',
+      chrono: true,
+    };
+  }
   if (campaignBattle) {
     return {
       mapLabel: campaignBattle.name,
@@ -212,6 +257,16 @@ window.addEventListener('resize', () => sizeCanvas(camera));
 
 /** Difficulty the next `restart()` will use. */
 let difficulty: AiDifficulty = 'normal';
+
+/**
+ * C1 (chrono campaign) — the era the next `restart()` will fight in. It travels
+ * exactly like `difficulty`: a module-level choice that `newGame()` hands to
+ * `initSkirmish` through `SkirmishOptions`. Skirmish and the V3 conquest
+ * campaign both open on `DEFAULT_ERA` ('silicon'), which is the shipped roster;
+ * C3's chrono campaign is what will select another one (through `__game.era` or
+ * its own mission configuration).
+ */
+let era: EraId = DEFAULT_ERA;
 
 /**
  * V2 — map selection. `mapChoice` is what the title row shows; `mapSeed` is the
@@ -234,9 +289,13 @@ function setMission(choice: MapChoice, seed: number): void {
   campaignBattle = null;
   campaignResolved = false;
   campaign.current = null;
+  chronoBattle = null;
+  chronoResolved = false;
+  chrono.current = null;
   mapChoice = choice;
   mapSeed = seed >>> 0;
   briefing.setMission(mapDef(choice).label, mapSeed);
+  briefing.setMoment(null);
 }
 
 /**
@@ -247,9 +306,37 @@ function setMission(choice: MapChoice, seed: number): void {
 function setCampaignMission(cfg: CampaignBattleConfig): void {
   campaignBattle = cfg;
   campaignResolved = false;
+  // Mode exclusivity: a battle belongs to exactly one mode, so adopting a
+  // conquest territory drops any chrono battle that was still hanging around.
+  chronoBattle = null;
+  chronoResolved = false;
+  chrono.current = null;
   difficulty = cfg.difficulty;
   mapSeed = cfg.seed >>> 0;
   briefing.setMission(cfg.name, mapSeed, 'TERRITORY');
+  briefing.setMoment(null);
+}
+
+/**
+ * C3: adopt a chrono moment as the next mission. Same contract as the conquest
+ * version, plus two things only this mode carries: the **era** (which decides
+ * the roster, the terrain palette and the briefing copy) and the anomaly flag.
+ */
+function setChronoMission(cfg: ChronoBattleConfig): void {
+  chronoBattle = cfg;
+  chronoResolved = false;
+  campaignBattle = null;
+  campaignResolved = false;
+  campaign.current = null;
+  difficulty = cfg.difficulty;
+  mapSeed = cfg.seed >>> 0;
+  briefing.setMission(cfg.name, mapSeed, 'MOMENT');
+  briefing.setMoment({
+    era: cfg.era,
+    moment: cfg.name,
+    year: cfg.yearLabel,
+    anomaly: cfg.origin,
+  });
 }
 
 /**
@@ -262,7 +349,19 @@ function setCampaignMission(cfg: CampaignBattleConfig): void {
  */
 function newGame(): GameState {
   const gs = createGameState(mapSeed);
-  initSkirmish(gs, campaignBattle ? { ...campaignBattle, difficulty } : { difficulty });
+  // C3: a chrono battle carries its **own** era (the moment decides what year
+  // you are fighting in), so the module-level `era` — which `__game.era()`
+  // selects for skirmishes and which the conquest campaign leaves on silicon —
+  // is deliberately not applied to it. The three modes are mutually exclusive,
+  // so at most one of these branches can be live.
+  initSkirmish(
+    gs,
+    chronoBattle
+      ? { ...chronoBattle, difficulty }
+      : campaignBattle
+        ? { ...campaignBattle, difficulty, era }
+        : { difficulty, era },
+  );
   return gs;
 }
 
@@ -297,7 +396,41 @@ function leaveCampaignBattle(): void {
   campaign.current = null;
 }
 
+/** C3: begin (or re-begin, on a retry) the insertion into a moment. */
+function startChronoBattle(id: string): boolean {
+  if (!beginMoment(chrono, id)) return false;
+  setChronoMission(chronoBattleConfig(chrono, id));
+  briefing.reset();
+  saveChrono(chronoStorage, chrono);
+  return true;
+}
+
+/** C3: R on a failed insertion — travel to the same moment again. */
+function retryChronoBattle(): void {
+  if (!chronoBattle) return;
+  if (!beginMoment(chrono, chronoBattle.moment)) return;
+  setChronoMission(chronoBattleConfig(chrono, chronoBattle.moment));
+  saveChrono(chronoStorage, chrono);
+}
+
+/** C3: drop out of a chrono battle without a result. */
+function leaveChronoBattle(): void {
+  chronoBattle = null;
+  chronoResolved = false;
+  chrono.current = null;
+}
+
 let state = newGame();
+/**
+ * C2: the terrain art is per era. `setTerrainPalette` only swaps which cached
+ * ramp `getTerrainSprite` serves, so it has to run *before* the terrain layer is
+ * composited — here at boot and again in `restart()`, which is the one path
+ * every mission (skirmish, campaign battle, R after a defeat) goes through.
+ */
+function applyEraPalette(): void {
+  setTerrainPalette(ERAS[state.era].paletteKey);
+}
+applyEraPalette();
 renderer.buildTerrain(state.map);
 camera.centerOnTile(humanStartTile(state).tx, humanStartTile(state).ty);
 
@@ -318,10 +451,17 @@ function restart(level?: AiDifficulty): GameState {
   if (level) difficulty = level;
   // A campaign battle being rebuilt has not been resolved yet.
   campaignResolved = false;
+  chronoResolved = false;
   state = newGame();
   api.state = state;
+  // The era's ground ramp is selected before the terrain layer is rebuilt; the
+  // radar's own downsampled copy follows it through `sidebar.reset()` below.
+  applyEraPalette();
   renderer.buildTerrain(state.map);
   renderer.invalidateFog();
+  // C2: the render-side impact effects (flak airbursts, bomb shockwaves) are
+  // keyed on state.tick and on projectile ids, both of which restart at 0.
+  renderer.resetFx();
   // Sidebar.reset() also drops the radar's downsampled terrain + shroud, which
   // are keyed on the old map / the old fog version numbering.
   sidebar.reset();
@@ -369,6 +509,9 @@ function tick(): void {
         // skirmish selection is disturbed — coming back to the title finds the
         // same sector and difficulty selected.
         campaignScreen.reset();
+      } else if (action.kind === 'chrono') {
+        // C3: the same, for the timeline map.
+        chronoScreen.reset();
       } else {
         // Both 'map' (row click) and 'start' (deploy) carry a resolved seed —
         // for RANDOM, a freshly rolled one. The mission is built at the
@@ -399,6 +542,32 @@ function tick(): void {
         campaign = resetCampaign(campaignStorage);
         leaveCampaignBattle();
         campaignScreen.reset();
+      }
+    }
+    phase = nextPhase(phase, action);
+    input.endTick();
+    return;
+  }
+
+  // C3 — chrono timeline: same contract again. Frozen sim, own frame counter,
+  // and every event it sees is swallowed because the tick returns immediately
+  // afterwards. It reads and writes only the chrono save; the conquest campaign
+  // cannot observe anything that happens here.
+  if (phase === 'chrono') {
+    const action = chronoScreen.update(raw, chrono, camera.canvasW, camera.canvasH);
+    if (action) {
+      sfx.play('click');
+      if (action.kind === 'enter') {
+        if (!startChronoBattle(action.moment)) {
+          // Not a legal move (already secured, locked, or the anomaly is still
+          // sealed). Stay put.
+          input.endTick();
+          return;
+        }
+      } else if (action.kind === 'reset') {
+        chrono = resetChrono(chronoStorage);
+        leaveChronoBattle();
+        chronoScreen.reset();
       }
     }
     phase = nextPhase(phase, action);
@@ -452,13 +621,31 @@ function tick(): void {
     // as usual, so nothing about the finished game survives.
     if (hudSnap.pressed.has('KeyT')) {
       leaveCampaignBattle();
+      leaveChronoBattle();
       phase = 'title';
       input.endTick();
       return;
     }
     const clicked = hudSnap.clicks.some((c) => c.button === 0);
     const pressedR = hudSnap.pressed.has('KeyR');
-    if (campaignBattle) {
+    if (chronoBattle) {
+      // C3: exactly the V3 shape. R retries a *failed* insertion; after a win
+      // the moment is secured and there is nothing to retry, so R behaves like
+      // the click and returns to the timeline, which is what the panel says.
+      if (pressedR && state.result === 'lost') {
+        retryChronoBattle();
+        restart();
+        input.endTick();
+        return;
+      }
+      if (pressedR || clicked) {
+        leaveChronoBattle();
+        chronoScreen.reset();
+        phase = 'chrono';
+        input.endTick();
+        return;
+      }
+    } else if (campaignBattle) {
       // V3: R retries the territory — but only when the assault failed. After a
       // win there is nothing left to retry (the ground is yours), so R behaves
       // like the click and returns to the map, which is what the panel says.
@@ -514,6 +701,21 @@ function tick(): void {
       stats: state.stats,
     });
     saveCampaign(campaignStorage, campaign);
+  }
+
+  // C3: the same latch for the timeline, and it can never fire in the same
+  // battle as the one above — `chronoBattle` and `campaignBattle` are mutually
+  // exclusive by construction (see `setMission` / `setCampaignMission` /
+  // `setChronoMission`), which is what makes each campaign's save untouched by
+  // the other's battles.
+  if (chronoBattle && !chronoResolved && state.result !== 'playing') {
+    chronoResolved = true;
+    resolveMoment(chrono, chronoBattle.moment, {
+      won: state.result === 'won',
+      ticks: state.tick,
+      stats: state.stats,
+    });
+    saveChrono(chronoStorage, chrono);
   }
 
   // Drain the sim's terrain-repaint queue into the two render-side caches that
@@ -689,6 +891,14 @@ export interface GameApi {
    * Force every sprite the factory can produce and report its dimensions and
    * opaque pixel count. Any entry under ~20 opaque px is a blank sprite.
    */
+  /**
+   * C1: read the era of the running battle, or select the era the **next**
+   * mission is fought in (exactly how `ai(level)` selects a difficulty). The
+   * running battle's era is never changed underneath it — the roster is
+   * resolved at `initSkirmish` time.
+   */
+  era(next?: string): { current: EraId; next: EraId; def: EraDef };
+
   spriteAudit(): SpriteAuditEntry[];
   /**
    * Audio test hook. With no argument it lists the catalogue; with a name it
@@ -739,6 +949,28 @@ export interface GameApi {
   campaignWin(): GameResult;
   /** V3: wipe the campaign save and start a fresh continent. */
   campaignReset(): CampaignReport;
+  /**
+   * C3: the whole chrono campaign — which moments you hold, which chrono gates
+   * are open, what the ORIGIN MOMENT is still waiting for, and the battle
+   * configuration each of the thirteen moments would be fought under *right
+   * now* (era, difficulty, credit bonus, wave/army scaling, pre-built
+   * defences, the mixed-roster flag, threat rating).
+   */
+  chrono(): ChronoReport;
+  /**
+   * C3: travel to a moment. The debug-hook counterpart of confirming on the
+   * insertion plate — same `startChronoBattle` path, so it counts an attempt,
+   * saves, and deploys. False when the move is not legal (already secured, the
+   * gate is locked, or the anomaly is still sealed).
+   */
+  chronoInvade(momentId: string): boolean;
+  /**
+   * C3: force the current chrono battle to a win so the timeline can be tested
+   * without playing twelve matches. The result then travels the *real* path.
+   */
+  chronoWin(): GameResult;
+  /** C3: wipe the chrono save and start a fresh timeline. */
+  chronoReset(): ChronoReport;
 }
 
 const api: GameApi = {
@@ -938,6 +1170,17 @@ const api: GameApi = {
     return restart(level !== undefined && isAiDifficulty(level) ? level : undefined);
   },
 
+  era(next?: string): { current: EraId; next: EraId; def: EraDef } {
+    if (next !== undefined) {
+      if (!isEraId(next)) {
+        console.warn(`[__game.era] unknown era "${next}" (trench|steel|silicon|future)`);
+      } else {
+        era = next;
+      }
+    }
+    return { current: state.era, next: era, def: ERAS[state.era] };
+  },
+
   spriteAudit(): SpriteAuditEntry[] {
     return auditSprites();
   },
@@ -961,6 +1204,9 @@ const api: GameApi = {
     } else if (next === 'campaign' && phase !== 'campaign') {
       campaignScreen.reset();
       phase = 'campaign';
+    } else if (next === 'chrono' && phase !== 'chrono') {
+      chronoScreen.reset();
+      phase = 'chrono';
     } else if (next === 'title') {
       phase = 'title';
     }
@@ -976,9 +1222,11 @@ const api: GameApi = {
   },
 
   briefing(): { revealed: number; total: number; complete: boolean } {
+    // C3: `total` is the *active* copy set's length — the skirmish briefing for
+    // a skirmish or a conquest battle, the era's own copy for a chrono moment.
     return {
       revealed: briefing.revealed,
-      total: BRIEFING_CHARS,
+      total: briefing.total,
       complete: briefing.complete,
     };
   },
@@ -1010,6 +1258,35 @@ const api: GameApi = {
     leaveCampaignBattle();
     campaignScreen.reset();
     return campaignReport(campaign);
+  },
+
+  chrono(): ChronoReport {
+    return chronoReport(chrono);
+  },
+
+  chronoInvade(momentId: string): boolean {
+    if (!isMomentId(momentId)) {
+      console.warn(`[__game.chronoInvade] unknown moment "${momentId}"`);
+      return false;
+    }
+    if (!startChronoBattle(momentId)) return false;
+    startMission();
+    return true;
+  },
+
+  chronoWin(): GameResult {
+    if (state.result === 'playing') {
+      state.result = 'won';
+      postMessage(state, 'Mission accomplished.', 'info');
+    }
+    return state.result;
+  },
+
+  chronoReset(): ChronoReport {
+    chrono = resetChrono(chronoStorage);
+    leaveChronoBattle();
+    chronoScreen.reset();
+    return chronoReport(chrono);
   },
 };
 

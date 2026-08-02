@@ -20,6 +20,7 @@ import {
   clamp,
   type PlayerId,
 } from './constants';
+import { DEFAULT_ERA, eraScoutUnit, type EraId } from './eras';
 import { findNearestPassable } from './pathfinding';
 import { BUILDING_TYPES, type BuildingTypeId } from './rules';
 import {
@@ -46,6 +47,12 @@ import { recomputeEconomy, spawnTileFor } from './systems/production';
 export interface SkirmishOptions {
   /** AI difficulty. Defaults to `DEFAULT_AI_DIFFICULTY` ('normal'). */
   difficulty?: AiDifficulty;
+  /**
+   * C1 (chrono campaign): the era this battle is fought in. Defaults to
+   * `DEFAULT_ERA` ('silicon'), which is the shipped roster — so every existing
+   * caller that omits it gets exactly the game it got before.
+   */
+  era?: EraId;
   /** Start with the map shrouded (default true). */
   fog?: boolean;
   /**
@@ -66,6 +73,13 @@ export interface SkirmishOptions {
    * legal to go is simply skipped.
    */
   aiPrebuilt?: readonly BuildingTypeId[];
+  /**
+   * C3 (chrono campaign): the ORIGIN MOMENT's temporal anomaly. Lifts the era
+   * roster gate for **The Order only**, so it can field landships next to
+   * spider mechs. Omitted / false everywhere else, including in the other
+   * twelve chrono moments. See `GameState.anomaly`.
+   */
+  aiAnomaly?: boolean;
 }
 
 /** Tile the free scout spawns on: south-east of the ConYard, on open ground. */
@@ -106,13 +120,21 @@ function placePrebuilt(state: GameState, ai: AiState, type: BuildingTypeId): Bui
  */
 export function initSkirmish(state: GameState, opts: SkirmishOptions = {}): void {
   const difficulty = opts.difficulty ?? DEFAULT_AI_DIFFICULTY;
+  // C1: the era is fixed before anything is placed, because every availability
+  // question (the AI's build plan included) reads it from the state.
+  state.era = opts.era ?? DEFAULT_ERA;
+  // C3: and so is the anomaly flag, for the same reason — it is half of the
+  // "which types exist" question and nothing may change it mid-battle.
+  state.anomaly = opts.aiAnomaly === true;
 
   state.map.startTiles.forEach((start, idx) => {
     const player = idx as PlayerId;
     // 3x3 ConYard centred on the start tile.
     createBuilding(state, 'conyard', start.tx - 1, start.ty - 1, player);
     const scout = scoutTile(state, start);
-    createUnit(state, 'minigunner', scout.tx, scout.ty, player);
+    // C1: the free scout is the era's line infantry ('minigunner' in silicon,
+    // i.e. the shipped opening unchanged).
+    createUnit(state, eraScoutUnit(state.era), scout.tx, scout.ty, player);
   });
 
   const extraCredits = Number.isFinite(opts.aiCreditBonus) ? (opts.aiCreditBonus as number) : 0;

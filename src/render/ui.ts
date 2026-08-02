@@ -43,8 +43,8 @@ import {
   type UnitStance,
 } from '../game/state';
 import {
-  BUILDABLE_STRUCTURES,
-  BUILDABLE_UNITS,
+  buildableStructuresFor,
+  buildableUnitsFor,
   MAX_UNIT_QUEUE,
   canBuild,
   canPlaceAt,
@@ -63,7 +63,13 @@ import {
 } from '../game/systems/orders';
 import { isEntityVisibleToHuman } from '../game/systems/fog';
 import type { HudInfo } from './renderer';
-import { drawPixelText, getBuildingIcon, getUnitIcon, measurePixelText } from './sprites';
+import {
+  drawPixelText,
+  getBuildingIcon,
+  getUnitIcon,
+  measurePixelText,
+  terrainPaletteKey,
+} from './sprites';
 
 type BuildTypeId = BuildingTypeId | UnitTypeId;
 
@@ -150,15 +156,65 @@ export interface MinimapRect {
   size: number;
 }
 
-/** RGB per terrain type, matching the terrain art's base tones. */
-const MINIMAP_TERRAIN: readonly (readonly [number, number, number])[] = [
-  [66, 80, 46], // grass
-  [150, 134, 91], // sand
-  [107, 100, 83], // rock
-  [74, 69, 56], // cliff
-  [63, 191, 95], // crystal (full)
-];
-const MINIMAP_CRYSTAL_SPENT: readonly [number, number, number] = [36, 92, 52];
+/**
+ * Radar ground colours, one row per terrain type, matching the terrain art's
+ * own base tones.
+ *
+ * C2: one table per era palette, so the radar agrees with the ground the world
+ * layer is actually drawing. `siliconDesert` holds the shipped constants
+ * verbatim — the 1991 radar is pixel-for-pixel what it always was.
+ */
+type MinimapRamp = {
+  terrain: readonly (readonly [number, number, number])[];
+  spent: readonly [number, number, number];
+};
+
+const MINIMAP_RAMPS: Record<string, MinimapRamp> = {
+  siliconDesert: {
+    terrain: [
+      [66, 80, 46], // grass
+      [150, 134, 91], // sand
+      [107, 100, 83], // rock
+      [74, 69, 56], // cliff
+      [63, 191, 95], // crystal (full)
+    ],
+    spent: [36, 92, 52],
+  },
+  trenchMud: {
+    terrain: [
+      [70, 72, 44],
+      [109, 92, 62],
+      [95, 88, 71],
+      [65, 58, 45],
+      [63, 191, 95],
+    ],
+    spent: [36, 92, 52],
+  },
+  steelWinter: {
+    terrain: [
+      [77, 86, 74],
+      [166, 173, 167],
+      [109, 114, 111],
+      [73, 78, 76],
+      [63, 191, 95],
+    ],
+    spent: [40, 96, 58],
+  },
+  futureNeon: {
+    terrain: [
+      [43, 49, 56],
+      [58, 57, 71],
+      [61, 67, 81],
+      [38, 43, 54],
+      [78, 224, 112],
+    ],
+    spent: [23, 102, 60],
+  },
+};
+
+function minimapRamp(): MinimapRamp {
+  return MINIMAP_RAMPS[terrainPaletteKey()] ?? (MINIMAP_RAMPS['siliconDesert'] as MinimapRamp);
+}
 /** Shroud alpha over explored-but-unseen ground; matches the world renderer. */
 const MINIMAP_FOG_ALPHA = 130;
 /** Pre-baked frames of radar static, cycled while the radar is down. */
@@ -215,10 +271,11 @@ class Minimap {
   }
 
   private paintTile(map: GameState['map'], i: number): void {
+    const ramp = minimapRamp();
     const t = map.terrain[i] as number;
-    let rgb = MINIMAP_TERRAIN[t] ?? MINIMAP_TERRAIN[0];
+    let rgb = ramp.terrain[t] ?? ramp.terrain[0];
     if (t === Terrain.Crystal && (map.crystal[i] as number) === 0) {
-      rgb = MINIMAP_CRYSTAL_SPENT;
+      rgb = ramp.spent;
     }
     const o = i * 4;
     const d = this.terrainImage.data;
@@ -480,8 +537,13 @@ export class Sidebar {
   private cells(state: GameState): Cell[] {
     const w = this.width;
     if (w <= 0) return [];
+    // C1: the grid offers only what the battle's era has heard of. In silicon
+    // these are `BUILDABLE_STRUCTURES` / `BUILDABLE_UNITS` verbatim, so the
+    // shipped build grid is unchanged.
     const list: readonly BuildTypeId[] =
-      state.ui.buildTab === 'structures' ? BUILDABLE_STRUCTURES : BUILDABLE_UNITS;
+      state.ui.buildTab === 'structures'
+        ? buildableStructuresFor(state)
+        : buildableUnitsFor(state);
     const cellW = (w - PAD * 2 - CELL_GAP * (COLS - 1)) / COLS;
     const map = this.minimapRect();
     const bottom = (map ? map.y - 4 : this.camera.canvasH - EVA_H) - 6;

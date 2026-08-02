@@ -18,6 +18,7 @@ import {
   tileCenter,
   type PlayerId,
 } from './constants';
+import { DEFAULT_ERA, type EraId } from './eras';
 import { generateMap } from './map';
 import {
   BUILDING_TYPES,
@@ -327,7 +328,7 @@ export interface Building {
   spawnTick?: number;
 }
 
-export type ProjectileKind = 'bullet' | 'shell' | 'rocket' | 'arc';
+export type ProjectileKind = 'bullet' | 'shell' | 'rocket' | 'arc' | 'beam';
 
 export interface Projectile {
   id: number;
@@ -357,6 +358,13 @@ export interface Projectile {
    * spawned by test helpers, which then behave as ground-only.
    */
   weapon?: WeaponId;
+  /**
+   * C1: this round has already dealt its damage and is only still in the array
+   * so the renderer can draw it (a `beam` hits on the tick it is fired). A spent
+   * round never moves, never re-aims and never damages anything again — it just
+   * ages `life` out. Absent on every travelling projectile.
+   */
+  spent?: boolean;
   /** Height above ground for arcing shots (render only). */
   arc?: number;
   /** Total flight distance in px, captured at launch (arc rendering). */
@@ -597,6 +605,28 @@ export interface GameState {
    * then, which makes `updateAi` a no-op on a bare state.
    */
   ai?: AiState;
+  /**
+   * C1 (chrono campaign): the era this battle is fought in. Additive and always
+   * present — `createGameState` opens on `DEFAULT_ERA` ('silicon', the shipped
+   * roster), and `initSkirmish` overwrites it from `SkirmishOptions.era`.
+   *
+   * It is read by `production.canBuild` (availability gating on top of the
+   * existing prereq system), by `ai.ts` (build plan + composition) and by the
+   * render side (palette, sidebar list). Nothing writes it after setup.
+   */
+  era: EraId;
+  /**
+   * C3 (chrono campaign): **the ORIGIN MOMENT's temporal anomaly.** False in
+   * every skirmish, every conquest battle and twelve of the thirteen chrono
+   * moments; `initSkirmish` sets it from `SkirmishOptions.aiAnomaly`.
+   *
+   * It lifts the era roster gate **for The Order only** — `canBuild` stops
+   * asking `eraAllows` for player 1, and the AI rolls its army from a mixed
+   * composition table (`ANOMALY_COMPOSITION` in `eras.ts`) instead of the era's
+   * own. The human stays era-locked: the sidebar's build lists are filtered by
+   * `eraHasUnit` / `eraHasBuilding`, which this does not touch.
+   */
+  anomaly: boolean;
   /** Seed this game was created with. */
   seed: number;
 }
@@ -658,6 +688,8 @@ export function createGameState(seed: number): GameState {
     rng: gameRng,
     messages: [],
     dirtyTiles: [],
+    era: DEFAULT_ERA,
+    anomaly: false,
     seed,
   };
 }

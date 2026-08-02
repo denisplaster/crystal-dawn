@@ -240,7 +240,12 @@ export function updateMovement(state: GameState): void {
     u.facing = normalizeAngle(u.facing + turn);
     const misalign = Math.abs(normalizeAngle(desired - u.facing));
 
-    let speed = def.speed * terrainFactor(state, u.pos.x, u.pos.y);
+    // C1: a hover unit ignores the terrain *cost* multiplier (sand / crystal
+    // never slow it). It is emphatically not a passability exemption — the path
+    // above is the ordinary A* one, so rock and cliffs still stop it.
+    let speed = def.ignoresTerrainCost
+      ? def.speed
+      : def.speed * terrainFactor(state, u.pos.x, u.pos.y);
     if (misalign > PIVOT_ANGLE) speed = 0;
     else if (misalign > SLOW_TURN_ANGLE) speed *= 0.45;
 

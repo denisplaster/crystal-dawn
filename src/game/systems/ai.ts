@@ -44,6 +44,14 @@ import {
   type BuildingTypeId,
   type UnitTypeId,
 } from '../rules';
+import {
+  ANOMALY_COMPOSITION,
+  eraAirPad,
+  eraAirUnit,
+  eraDef,
+  eraDefenseTower,
+  type EraId,
+} from '../eras';
 import type { Building, GameState, PlayerState, TilePos, Unit } from '../state';
 import { distanceToEntity, issueAttackOrder } from './combat';
 import { issueGroundOrder, stopUnits } from './orders';
@@ -233,27 +241,45 @@ const PLACE_FAIL_LIMIT = 24;
 /** Home field this far below its starting crystal counts as "depleted". */
 const FIELD_DEPLETED = 0.35;
 
-/**
- * Structures the AI will not let itself run out of, in build order.
- *
- * `only` (V2) gates an entry on difficulty: the helipad is an easy-mode-free
- * extra, so an easy AI never fields aircraft and the opening it plays is
- * bit-identical to the pre-V2 one.
- */
-const BUILD_PLAN: readonly {
+interface BuildPlanStep {
   type: BuildingTypeId;
   count: number;
   only?: readonly AiDifficulty[];
-}[] = [
-  { type: 'powerPlant', count: 1 },
-  { type: 'refinery', count: 1 },
-  { type: 'barracks', count: 1 },
-  { type: 'powerPlant', count: 2 },
-  { type: 'warFactory', count: 1 },
-  { type: 'helipad', count: 1, only: ['normal', 'hard'] },
-  { type: 'guardTower', count: 2 },
-  { type: 'commCenter', count: 1 },
-];
+}
+
+/** One plan per era, built on first use and then reused (it is immutable data). */
+const BUILD_PLANS = new Map<EraId, readonly BuildPlanStep[]>();
+
+/**
+ * Structures the AI will not let itself run out of, in build order.
+ *
+ * `only` (V2) gates an entry on difficulty: the air pad is an easy-mode-free
+ * extra, so an easy AI never fields aircraft and the opening it plays is
+ * bit-identical to the pre-V2 one.
+ *
+ * C1: the plan is now built **per era**, but only two of its eight entries are
+ * era-dependent — the pad (`helipad` / `airstrip` / none in 1917) and the
+ * defence emplacement (`guardTower` / `mgnest` / `flaktower` / `lasertower`).
+ * In `silicon` the array this produces is entry-for-entry the pre-C1 one, which
+ * is what keeps a skirmish opening identical.
+ */
+function buildPlanFor(era: EraId): readonly BuildPlanStep[] {
+  const cached = BUILD_PLANS.get(era);
+  if (cached) return cached;
+  const pad = eraAirPad(era);
+  const plan: BuildPlanStep[] = [
+    { type: 'powerPlant', count: 1 },
+    { type: 'refinery', count: 1 },
+    { type: 'barracks', count: 1 },
+    { type: 'powerPlant', count: 2 },
+    { type: 'warFactory', count: 1 },
+  ];
+  if (pad) plan.push({ type: pad, count: 1, only: ['normal', 'hard'] });
+  plan.push({ type: eraDefenseTower(era), count: 2 });
+  plan.push({ type: 'commCenter', count: 1 });
+  BUILD_PLANS.set(era, plan);
+  return plan;
+}
 
 /** Wave number from which the AI folds aircraft into its attacks (wave 3). */
 const AIR_FROM_WAVE = 3;
@@ -637,6 +663,9 @@ function needsMoreEconomy(state: GameState, ai: AiState): boolean {
 /** The structure the AI wants next, or null when it is content. */
 function nextStructure(state: GameState, ai: AiState, p: PlayerState): BuildingTypeId | null {
   const want = (type: BuildingTypeId): boolean => canBuild(state, PLAYER_AI, type);
+  // C1: "guard tower" is whatever this era's emplacement is. Everything else the
+  // AI builds is shared by all four eras.
+  const tower = eraDefenseTower(state.era);
 
   // 1. Power first, always: a deficit halves every build in the base.
   const margin = p.powerProduced - p.powerDrain;
@@ -646,7 +675,7 @@ function nextStructure(state: GameState, ai: AiState, p: PlayerState): BuildingT
 
   // 2. The opening, which doubles as the rebuild list: any plan entry that has
   //    fallen below its target count is re-queued.
-  for (const step of BUILD_PLAN) {
+  for (const step of buildPlanFor(state.era)) {
     if (step.only && !step.only.includes(ai.difficulty)) continue;
     if (countBuildings(state, step.type) >= step.count) continue;
     if (want(step.type)) return step.type;
@@ -670,19 +699,19 @@ function nextStructure(state: GameState, ai: AiState, p: PlayerState): BuildingT
   // 5. Late-game: thicken the perimeter with spare cash.
   if (
     ai.waveNumber >= 3 &&
-    countBuildings(state, 'guardTower') < MAX_TOWERS &&
+    countBuildings(state, tower) < MAX_TOWERS &&
     p.credits >= 1500 &&
-    want('guardTower')
+    want(tower)
   ) {
-    return 'guardTower';
+    return tower;
   }
 
   // 6. Phase 7 — the late-game credit pin. Army capped and the bank full: the
   //    AI used to sit on 10000cr forever. Spend it on defence first, then on
   //    silos, which raise the ceiling so the next pin is further away.
   if (creditsPinned(p) && armySize(state, p).army >= tuningOf(ai).armyCap) {
-    if (countBuildings(state, 'guardTower') < MAX_TOWERS && want('guardTower')) {
-      return 'guardTower';
+    if (countBuildings(state, tower) < MAX_TOWERS && want(tower)) {
+      return tower;
     }
     if (countBuildings(state, 'silo') < MAX_SILOS + LATE_EXTRA_SILOS && want('silo')) {
       return 'silo';
@@ -814,16 +843,22 @@ function rollWantedUnit(
   const hasCC = hasBuilding(state, PLAYER_AI, 'commCenter');
   const infantryOk = !hasWF || army === 0 || infantry / army < INFANTRY_SHARE;
 
-  add('minigunner', !hasWF ? 6 : infantryOk ? 2 : 0);
-  add('rocketSoldier', !hasWF ? 3 : infantryOk ? 3 : 0);
-  if (hasWF) {
-    add('lightTank', hasCC ? 3 : 6);
-    if (hasCC) {
-      add('mediumTank', 5);
-      // Artillery is a siege weapon: only worth it once the waves are big
-      // enough to screen it.
-      if (ai.waveNumber >= 2) add('artillery', 3);
-    }
+  // C1: the weights come from the era's composition table, walked in array
+  // order, and the three phases are exactly the three the pre-C1 code branched
+  // on. In silicon this produces the identical pool — minigunner, rocketSoldier,
+  // lightTank, mediumTank, artillery, with the identical weights per phase — so
+  // the same RNG draw picks the same type.
+  // C3: in the ORIGIN MOMENT's anomaly the rows come from the mixed table
+  // instead — same walk, same phases, same gates, four eras of hardware. This
+  // is the only line in the AI that C3 touched, and `state.anomaly` is false in
+  // every other battle in the game.
+  const phase: 'early' | 'late' | 'tech' = !hasWF ? 'early' : hasCC ? 'tech' : 'late';
+  const rows = state.anomaly ? ANOMALY_COMPOSITION : eraDef(state.era).composition;
+  for (const row of rows) {
+    // Siege weapons wait for waves big enough to screen them.
+    if (row.minWave !== undefined && ai.waveNumber < row.minWave) continue;
+    const weight = row.infantry === true && !infantryOk ? 0 : row[phase];
+    add(row.type, weight);
   }
 
   if (pool.length === 0) return null;
@@ -884,15 +919,20 @@ function stepUnits(state: GameState, ai: AiState, p: PlayerState): void {
   // would have re-tuned every existing wave. Everything after this point — the
   // army cap, the rally group, wave assembly — treats the gunship as an
   // ordinary combat unit, so no wave logic changed.
+  // C1: "the gunship" is whatever this era flies — the dive bomber in 1943, the
+  // swarm drone in 2077, and nothing at all in 1917 (the branch is then skipped
+  // outright). In silicon `airType` is 'gunship' and this is the pre-C1 code.
+  const airType = eraAirUnit(state.era);
   const airWanted = AIR_WANTED[ai.difficulty];
   if (
+    airType !== null &&
     airWanted > 0 &&
     ai.waveNumber >= AIR_FROM_WAVE - 1 &&
-    canBuild(state, PLAYER_AI, 'gunship') &&
-    countUnits(state, 'gunship') + countQueued(p, 'gunship') < airWanted &&
-    spendable >= UNIT_TYPES.gunship.cost
+    canBuild(state, PLAYER_AI, airType) &&
+    countUnits(state, airType) + countQueued(p, airType) < airWanted &&
+    spendable >= UNIT_TYPES[airType].cost
   ) {
-    if (enqueue(state, PLAYER_AI, 'gunship')) return;
+    if (enqueue(state, PLAYER_AI, airType)) return;
   }
 
   // --- army cap ---
